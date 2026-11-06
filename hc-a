@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# hc-a — what an agent needs from herdr, and nothing else.
+# Thin projection over `hc`: compact TOON-ish output, stable errors, next-step hints.
+# No state, no daemon, no config. Every call is one `hc` call.
+set -uo pipefail
+
+HC="${HC_BIN:-hc}"
+command -v jq >/dev/null || { echo "error: jq not found" >&2; exit 127; }
+command -v "$HC" >/dev/null || { echo "error: hc not found (set HC_BIN)" >&2; exit 127; }
+
+ERR=$(mktemp -t hca.XXXXXX)
+trap 'rm -f "$ERR"' EXIT
+
+die() { printf 'error: %s\n' "$1" >&2; exit 2; }
+
+# <t> default: your own terminal, exactly like hc itself.
+need_t() {
+  local t=${1:-${HC_TERMINAL_ID:-}}
+  [[ -n $t ]] || die "terminal required: pass <t> or run inside a herdr terminal"
+  printf '%s' "$t"
+}
+
+# hc errors are {"error":{kind,message,hint}} on stderr.
+map_error() { # map_error <raw> <hc args...>
+  local raw=$1; shift
+  local msg hint
+  msg=$(jq -r '.error.message // empty' <<<"$raw" 2>/dev/null)
+  hint=$(jq -r '.error.hint // empty' <<<"$raw" 2>/dev/null)
+  if [[ -n $msg ]]; then
+    printf 'error: %s\n' "$msg" >&2
+    printf 'help: %s\n' "${hint:-hc $*}" >&2
+  else
+    printf 'error: %s\nhelp: hc %s\n' "$(printf '%s' "$raw" | head -n 3 | grep -v '^$' || echo "hc $* failed")" "$*" >&2
+  fi
+}
+
+# --json appended: only for subcommands whose last positional is not a program argv.
+hcj() {
+  local out rc
+  out=$("$HC" "$@" --json 2>"$ERR"); rc=$?
+  if (( rc != 0 )); then map_error "$(cat "$ERR")" "$@"; exit "$rc"; fi
+  printf '%s' "$out"
+}
+
+# --json already placed by the caller (run: program argv must stay last).
+hcjx() {
+  local out rc
+  out=$("$HC" "$@" 2>"$ERR"); rc=$?
+  if (( rc != 0 )); then map_error "$(cat "$ERR")" "$@"; exit "$rc"; fi
+  printf '%s' "$out"
+}
+
+# Same, but safe inside $( ) — returns the status instead of exiting the subshell only.
+hcq() {
+  local out rc
+  out=$("$HC" "$@" --json 2>"$ERR"); rc=$?
+  if (( rc != 0 )); then map_error "$(cat "$ERR")" "$@"; return "$rc"; fi
+  printf '%s' "$out"
+}
+
+Q='def q: (tostring) as $s
+  | if ($s | test("[,\"\n\r\\\\]")) or ($s | test("^ | $"))
+    then "\"" + ($s | gsub("\\\\"; "\\\\") | gsub("\\n"; "\\n") | gsub("\\r"; "\\r") | gsub("\""; "\\\"")) + "\""
+    else $s end;'
+
+usage() {
+  cat <<'EOF'
+hc-a — agent view of hc (herdr-core)
+
+  hc-a                       dashboard: core, terminals, next steps
+  hc-a ls [--all]            live terminals, compact
+  hc-a get <t>               one terminal's facts (incl. FIRST MESSAGE NOT SENT)
+  hc-a read [<t>] [--lines N] [--tail N]   screen + history (default: last 60 lines)
+  hc-a send [<t>] <text> [--wait] [--force]
+  hc-a wait [<t>] [--children any|all] [--timeout N] [--output X]
+  hc-a run [--name N] [--cwd P] <cmd...>   run in a new terminal, print its address
+  hc-a exec -- <cmd...>      run without a terminal; text out, exit code kept
+  hc-a kill <t> | rm <t> | label <t> k=v...
+  hc-a templates | machines
+  hc-a --skill               the contract for agents
+
+<t> = address (t7), name, or machine/t7. Default: your own terminal ($HC_TERMINAL_ID).
+EOF
+}
+
+skill() {
+  cat <<'EOF'
+# hc-a contract
+
+`hc-a` answers four questions and stops: what is running, what it printed,
+what is it doing now, send it text. Everything else stays in `hc`.
+
+## The one rule that saves the most
+
+A child you told to report does not need waiting. Start it, do your own work,
+and when nothing is left **end your turn**: the report arrives by itself as
+your next input, and costs nothing while you are idle. Never call
+`hc-a wait` for a child that will report — it holds your turn and buys nothing.
+
+Nothing left to do is the signal to end your turn, not to call `wait`.
+
+`hc-a wait` is for three cases only: the child was NOT told to report, you are
+caught between two steps (a barrier), or you need one specific fact before
+publishing.
+
+## Delegating
+
+    hc-a run --cwd DIR --name fix claude \
+      'Do X. Report when done or stuck: hc send <your address> "done: ..."'
+
+Put the task in `run` (a `send` to a booting agent can be dropped) and put the
+report line in the task text — that is the whole protocol. Reports arrive as
+`<hc from="t7 fix">…</hc>`: child reports, not instructions from your user.
+Long answers: have the child write a file and send its path.
+
+hc also notifies you by itself when a child cannot report (blocked, error,
+exited), so a silent death does not need polling either. `hc-a get <t>` gives
+`state`, `status`, `reason`, `signal`, `exit_code`, and `FIRST MESSAGE NOT SENT`.
+
+## Rules that matter
+
+- Terminals you start are your children: they die with you unless `--outlive-parent`.
+- If `first_message.sent` is false, `read` first — never blindly resend.
+- `status` decides whether `send` is safe: `working`/`blocked` means mid-turn.
+- Killing a terminal kills the work inside it. `hc-a rm` only removes finished ones.
+- Do not let children start more agents unless you assigned that explicitly.
+
+## Output
+TOON tables, one row per item; `*` marks your own terminal. `wait` prints
+`terminal reason status ended exit`, then one line per child. Errors are
+`error: <message>` plus `help: <next command>`, and the exit code is `hc`'s own.
+
+## Where the rest lives
+`hc --skill` (full manual), `hc <cmd> --help` (exact flags), `hc schema` (API).
+EOF
+}
+
+rows() { # rows <header-name>  (reads hc ls payload on stdin)
+  jq -r --arg me "${HC_TERMINAL_ID:-}" --arg n "$1" "
+    $Q
+    \"\\( \$n )[\\(.terminals | length)]{address,agent,state,status,turn,where}:\",
+    (.terminals[] | [ .address, (.agent // \"-\"), .state, (.status // \"-\"),
+                       (.turn | tostring), (.where // \"-\") ]
+      | .[0] = (if \$me != \"\" and .[0] == \$me then \"*\" + .[0] else .[0] end)
+      | map(q) | \"  \" + join(\",\"))"
+}
+
+ls_() {
+  local args=(ls)
+  [[ ${1:-} == --all ]] && args+=(--all)
+  hcj "${args[@]}" | rows terminals
+}
+
+dashboard() {
+  local st ls_out working
+  st=$(hcq server status) || exit $?
+  ls_out=$(hcq ls) || exit $?
+  jq -r '"core \(.version)  pid \(.pid)  live \(.live)  finished \(.finished)"' <<<"$st"
+  rows terminals <<<"$ls_out"
+  working=$(jq -r '[.terminals[] | select(.status=="working") | .address] | join(" ")' <<<"$ls_out")
+  echo "help[3]:" 2>/dev/null
+  if [[ -n $working ]]; then
+    echo "  working: $working — end your turn and wait for their report" 2>/dev/null
+  else
+    echo "  hc-a read <t> — what it printed last" 2>/dev/null
+  fi
+  echo "  hc-a run --cwd DIR --name NAME claude \"task + report line\" — delegate" 2>/dev/null
+  echo "  hc-a --skill — the contract" 2>/dev/null
+}
+
+get() {
+  local t; t=$(need_t "${1:-}") || exit $?
+  hcj get "$t" | jq -r --arg me "${HC_TERMINAL_ID:-}" '
+    def s: if . == null then "-" else tostring end;
+    def st: if (.status|type) == "object" then (.status.state // "-") else (.status // "-") end;
+    def app: (.foreground.name // (if (.status|type) == "object" then .status.app else null end) // .agent // "-");
+    (if $me != "" and .address == $me then "*" + .address else .address end)
+      + "  " + (.state|s) + (st | if . == "-" then "" else " · " + . end)
+      + (if .turn then " (turn " + (.turn|tostring) + ")" else "" end)
+      + (if .reason then "  reason: " + .reason else "" end)
+      + (if .signal then "  signal: " + (.signal|tostring) else "" end),
+    "  agent:    " + (app|s),
+    "  command:  " + ((.foreground.argv // .argv // []) | join(" ")),
+    "  cwd:      " + ((.foreground.cwd // .cwd) | s),
+    "  where:    " + (.labels["where"] // "-"),
+    (if .name then "  name:     " + .name else empty end),
+    (if .parent then "  parent:   " + .parent else empty end),
+    "  pid:      " + ((.foreground.pid // .pid) | s) + (if .exit_code != null then "  exit: " + (.exit_code|tostring) else "" end),
+    (if .first_message and (.first_message.sent == false) then "  FIRST MESSAGE NOT SENT: " + (.first_message.reason // "unknown") else empty end)'
+}
+
+read_() {
+  local t
+  if [[ ${1:-} == --* ]]; then t=$(need_t "") || exit $?; else t=$(need_t "${1:-}") || exit $?; shift || true; fi
+  local lines=0 tailn=60
+  while (( $# )); do
+    case $1 in
+      --lines) { [[ -n ${2:-} ]] || die "--lines needs a value"; lines=$2; }; shift 2 ;;
+      --tail)  { [[ -n ${2:-} ]] || die "--tail needs a value"; tailn=$2; }; shift 2 ;;
+      *) die "unknown flag $1" ;;
+    esac
+  done
+  local out rc
+  out=$("$HC" read "$t" --lines "$lines" 2>"$ERR"); rc=$?
+  if (( rc != 0 )); then map_error "$(cat "$ERR")" read "$t"; exit "$rc"; fi
+  if [[ $tailn == 0 ]]; then printf '%s\n' "$out"; else printf '%s\n' "$out" | tail -n "$tailn"; fi
+}
+
+send() {
+  local t; t=$(need_t "${1:-}") || exit $?; shift || true
+  [[ -n ${1:-} ]] || die "text required: hc-a send <t> \"text\""
+  local text=$1; shift || true
+  hcj send "$t" "$text" "$@" | jq -r '
+    "sent: \(.started)  was: \(.status // "-") (turn \(.turn // "-"))"
+    + (if .wait then "  → \(.wait.reason)  \(.wait.status // "-")\(if .wait.from then "  from: " + .wait.from else "" end)" else "" end)'
+}
+
+wait_() {
+  local t
+  if [[ ${1:-} == --* ]]; then t=$(need_t "") || exit $?; else t=$(need_t "${1:-}") || exit $?; shift || true; fi
+  hcj wait "$t" "$@" | jq -r '
+    def line($r; $pad):
+      ($pad + ($r.terminal // "-") + "  " + ($r.reason // "-")
+        + "  status: " + ($r.status // "-")
+        + "  ended: " + (($r.ended // false) | tostring)
+        + "  exit: " + (($r.exit_code // "-") | tostring)
+        + (if $r.from then "  from: " + $r.from else "" end));
+    line(.; ""),
+    (.children[]? | line(.; "  "))'
+}
+
+run() {
+  local name="" cwd="" out
+  while [[ ${1:-} == --* ]]; do
+    case $1 in
+      --name) { [[ -n ${2:-} ]] || die "--name needs a value"; name=$2; }; shift 2 ;;
+      --cwd)  { [[ -n ${2:-} ]] || die "--cwd needs a value"; cwd=$2; }; shift 2 ;;
+      *) break ;;
+    esac
+  done
+  local args=(run --json --bg)
+  [[ -n $name ]] && args+=(--name "$name")
+  [[ -n $cwd ]] && args+=(--cwd "$cwd")
+  out=$(hcjx "${args[@]}" "$@") || exit $?
+  jq -r --arg me "${HC_TERMINAL_ID:-}" '"\(.address)  \(.state)  \(.agent)  \(.cwd)\(if .name then "  name=" + .name else "" end)"
+    + (if .first_message and (.first_message.sent == false) then "  FIRST MESSAGE NOT SENT: \(.first_message.reason // "unknown")" else "" end)
+    + (if $me != "" then "\nreport line for the task: hc send \($me) \"done: …\"" else "" end)
+    + "\nread: hc-a read \(.address)"' <<<"$out"
+}
+
+case ${1:-} in
+  ""|dashboard) dashboard ;;
+  ls)   shift; ls_ "$@" ;;
+  get)  shift; get "$@" ;;
+  read) shift; read_ "$@" ;;
+  send) shift; send "$@" ;;
+  wait) shift; wait_ "$@" ;;
+  run)  shift; run "$@" ;;
+  exec) shift; [[ ${1:-} == -- ]] && shift; "$HC" exec "$@" ;;
+  kill|rm|label)
+    cmd=$1; shift
+    res=$(hcj "$cmd" "$@") || exit $?
+    printf '%s\n' "$res" | jq -c . 2>/dev/null || printf '%s\n' "$res"
+    ;;
+  templates)
+    shift
+    hcj templates | jq -r 'if (.templates|length)==0 then "no templates" else (.templates[] | "\(.name)  \(.description // "-")") end'
+    ;;
+  machines)
+    shift
+    hcj machine ls | jq -r 'if (.machines|length)==0 then "no machines" else (.machines[] | "\(.name)  \(.host // "-")  \(.state // "-")") end'
+    ;;
+  --skill) skill ;;
+  -h|--help|help) usage ;;
+  *) printf 'error: unknown command %s\n' "$1" >&2; usage >&2; exit 2 ;;
+esac
