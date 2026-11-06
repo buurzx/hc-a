@@ -2,6 +2,8 @@
 
 **An agent-friendly CLI for [Herdr](https://herdr.dev) / [herdr-core](https://github.com/herdrdev/herdr-core): see your terminals, delegate work to other agents, and get the result back — without burning context on JSON.**
 
+![hc-a — an agent-friendly CLI for herdr-core](.github/social-preview.png)
+
 `hc-a` is a thin wrapper over `hc`, the command-line interface of herdr-core. It is for
 people who run coding agents (Claude Code, Codex, OpenCode, Pi, omp, …) inside Herdr and
 want one agent to start, steer and collect results from another.
