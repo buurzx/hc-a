@@ -65,14 +65,24 @@ between two steps, or one specific fact before publishing. It prints
 
 ## A separate tab
 
-The window owns tabs; `hc-a` places terminals in your own tab.
+`hc-a run` places terminals in your own tab. For a visible separate tab use `hc-a tab`:
 
 ```sh
-herdr-app do tab.new --name probe --folder /tmp --argv '["omp"]' --task "do X"
-# → {"space": "...", "tab": "tb…", "terminal": "t5g"}
+hc-a tab --name builder --folder "$PWD" --argv '["omp"]' --task "do X"
+# t5g  space t-monitor  tab builder
+# close: herdr-app do tab.close --id tb… --confirmed true
+# report line for the task: hc send t55 "done: …"
+# read: hc-a read t5g
 hc-a read t5g --tail 40
-herdr-app do tab.close --id tb… --confirmed true
 ```
+
+The tab goes in **your own space** — the space of the terminal you are running in — so it
+stays with the parent. Pass `--space <id|name>` only to deliberately put it elsewhere.
+
+Do not call `herdr-app do tab.new` directly for this: without `--space` it uses the space
+*selected in the window*, which may be someone else's. `--folder` is only the working
+directory; it does not choose a space. `hc-a tab` passes the space explicitly and checks
+the space that came back, so a mismatch is an error.
 
 ## Output
 

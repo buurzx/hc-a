@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # hc-a — what an agent needs from herdr, and nothing else.
 # Thin projection over `hc`: compact TOON-ish output, stable errors, next-step hints.
-# No state, no daemon, no config. Every call is one `hc` call.
+# No state, no daemon, no config. Every call is one or two upstream calls: `hc`;
+# for `tab`, `herdr-app ls` then `herdr-app do tab.new` (the window owns tabs).
 set -uo pipefail
 
 HC="${HC_BIN:-hc}"
+APP="${HERDR_APP_BIN:-herdr-app}"
 
 # Resolve this script through symlinks (the documented install is a link into the checkout).
 # `readlink -f` is GNU-only and this must run on bash 3.2 / BSD too.
@@ -32,6 +34,8 @@ hc-a — agent view of hc (herdr-core)
   hc-a send <t> <text> [--wait] [--force]
   hc-a wait [<t>] [--children any|all] [--timeout N] [--output X]
   hc-a run [--name N] [--cwd P] <cmd...>   run in a new terminal, print its address
+  hc-a tab [--space S] [--name N] [--folder P] [--argv JSON] [--task T]
+                             new tab in YOUR space by default; --space to override
   hc-a exec -- <cmd...>      run without a terminal; text out, exit code kept
   hc-a kill <t> | rm <t> | label <t> k=v...
   hc-a templates | machines
@@ -56,6 +60,7 @@ The full contract ships as SKILL.md beside the script and is missing here, so th
 what you need to start:
 
   hc-a run --cwd DIR --name NAME <agent> "task"   start a child, prints its report line
+  hc-a tab --name NAME --argv '["<agent>"]' --task "task"   a tab in YOUR space
   hc-a ls | get [<t>] | read [<t>] --tail 60      what is running, what it printed
   hc-a send <t> "text"                            steer it
   hc-a wait [<t>] [--children any|all]            only when no report is coming
@@ -149,13 +154,14 @@ dashboard() {
   jq -r '"core \(.version)  pid \(.pid)  live \(.live)  finished \(.finished)"' <<<"$st"
   rows terminals <<<"$ls_out"
   working=$(jq -r '[.terminals[] | select(.status=="working") | .address] | join(" ")' <<<"$ls_out")
-  echo "help[3]:" 2>/dev/null
+  echo "help[4]:" 2>/dev/null
   if [[ -n $working ]]; then
     echo "  working: $working — end your turn and wait for their report" 2>/dev/null
   else
     echo "  hc-a read <t> — what it printed last" 2>/dev/null
   fi
   echo "  hc-a run --cwd DIR --name NAME claude \"task + report line\" — delegate" 2>/dev/null
+  echo "  hc-a tab --name NAME --argv '[\"claude\"]' --task \"…\" — own space" 2>/dev/null
   echo "  hc-a --skill — the contract" 2>/dev/null
 }
 
@@ -245,6 +251,103 @@ run() {
     + "\nread: hc-a read \(.address)"' <<<"$out"
 }
 
+# herdr-app talks JSON and reports failures as {"error":"..."} (a string) on stdout.
+app_json() { # app_json <args...>
+  local out rc msg
+  command -v "$APP" >/dev/null || { printf 'error: herdr-app not found (set HERDR_APP_BIN)\n' >&2; exit 127; }
+  out=$("$APP" "$@" 2>"$ERR"); rc=$?
+  if (( rc != 0 )); then
+    msg=$(jq -r 'if (.error|type) == "object" then (.error.message // empty) else (.error // empty) end' \
+      <<<"$out" 2>/dev/null)
+    [[ -n $msg ]] || msg=$(head -n 3 "$ERR" 2>/dev/null)
+    printf 'error: %s\nhelp: herdr-app commands\n' "${msg:-herdr-app $* failed}" >&2
+    exit "$rc"
+  fi
+  printf '%s' "$out"
+}
+
+# tab.new accepts space ids only: --space agentic-system is `no space "agentic-system"`,
+# so a name is resolved here.
+space_id() { # space_id <wanted>  (reads herdr-app ls)
+  jq -r --arg s "$1" 'first(.spaces[] | select(.id == $s or .name == $s)) | .id // empty'
+}
+
+# The space this terminal lives in: the label herdr-app sets on every terminal it adopts.
+# Never fall back to the window's selected space — that is the cross-space bug.
+own_space_id() { # own_space_id  (reads herdr-app ls)
+  local t=${HC_TERMINAL_ID:-} id=""
+  [[ -n $t ]] || return 0
+  id=$("$HC" get "$t" --json 2>/dev/null | jq -r '.labels["herdr.space"] // empty' 2>/dev/null)
+  if [[ -z $id ]]; then
+    id=$(jq -r --arg t "$t" 'first(.spaces[] | select(any(.tabs[].terminals[]?; .terminal == $t)) | .id) // empty')
+  fi
+  printf '%s' "$id"
+}
+
+tab_() {
+  local name="" space="" folder="" argv="" task="" mod="" props=""
+  while [[ ${1:-} == --* ]]; do
+    case $1 in
+      --name|--space|--folder|--argv|--task|--mod|--props)
+        [[ -n ${2:-} ]] || die "$1 needs a value"
+        case $1 in
+          --name) name=$2 ;;   --space) space=$2 ;; --folder) folder=$2 ;;
+          --argv) argv=$2 ;;   --task) task=$2 ;;   --mod) mod=$2 ;; --props) props=$2 ;;
+        esac ;;
+      *) die "unknown flag $1" ;;
+    esac
+    shift $(( $# < 2 ? $# : 2 ))
+  done
+  (( $# == 0 )) || die "unexpected argument: $1 (tab takes only flags; see hc-a --help)"
+
+  local sj sid
+  sj=$(app_json ls) || exit $?
+  if [[ -n $space ]]; then
+    sid=$(space_id "$space" <<<"$sj")
+    [[ -n $sid ]] || die "no space \"$space\" (herdr-app ls lists them)"
+  else
+    sid=$(own_space_id <<<"$sj")
+    [[ -n $sid ]] || die "cannot tell your space: run inside a herdr terminal or pass --space <id|name>"
+  fi
+
+  local args=(do tab.new --space "$sid")
+  [[ -n $name ]]   && args+=(--name "$name")
+  [[ -n $folder ]] && args+=(--folder "$folder")
+  [[ -n $argv ]]   && args+=(--argv "$argv")
+  [[ -n $task ]]   && args+=(--task "$task")
+  [[ -n $mod ]]    && args+=(--mod "$mod")
+  [[ -n $props ]]  && args+=(--props "$props")
+
+  local out got tab term sname
+  out=$(app_json "${args[@]}") || exit $?
+  got=$(jq -r '.space // empty' <<<"$out")
+  tab=$(jq -r '.tab // empty' <<<"$out")
+  term=$(jq -r '.terminal // empty' <<<"$out")
+  # A successful reply means the tab exists; check it landed in the space we asked for.
+  if [[ $got != "$sid" ]]; then
+    printf 'error: tab created in space %s, wanted %s\n' "${got:-none}" "$sid" >&2
+    [[ -n $tab ]] && printf 'help: herdr-app do tab.close --id %s --confirmed true\n' "$tab" >&2
+    exit 1
+  fi
+  # A terminal tab must report its terminal; a mod tab has a pane instead.
+  if [[ -z $term && -z $mod ]]; then
+    printf 'error: tab %s has no terminal\n' "${tab:-?}" >&2
+    printf 'help: herdr-app ls\n' >&2
+    exit 1
+  fi
+  sname=$(jq -r --arg id "$sid" 'first(.spaces[] | select(.id == $id) | .name) // empty' <<<"$sj")
+  if [[ -n $term ]]; then
+    printf '%s  space %s  tab %s\n' "$term" "${sname:-$sid}" "${name:-$tab}"
+  else
+    printf '%s  space %s  tab %s\n' "$tab" "${sname:-$sid}" "${name:-$tab}"
+  fi
+  printf 'close: herdr-app do tab.close --id %s --confirmed true\n' "$tab"
+  if [[ -n $term ]]; then
+    [[ -n ${HC_TERMINAL_ID:-} ]] && printf 'report line for the task: hc send %s "done: …"\n' "$HC_TERMINAL_ID"
+    printf 'read: hc-a read %s\n' "$term"
+  fi
+}
+
 case ${1:-} in
   ""|dashboard) dashboard ;;
   ls)   shift; ls_ "$@" ;;
@@ -253,6 +356,7 @@ case ${1:-} in
   send) shift; send "$@" ;;
   wait) shift; wait_ "$@" ;;
   run)  shift; run "$@" ;;
+  tab)  shift; tab_ "$@" ;;
   exec) shift; [[ ${1:-} == -- ]] && shift; "$HC" exec "$@" ;;
   kill|rm|label)
     cmd=$1; shift

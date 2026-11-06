@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tests for hc-a. No herdr, no network: `hc` is replaced by a stub via HC_BIN.
+# Tests for hc-a. No herdr, no network: `hc` is replaced by a stub via HC_BIN and
+# `herdr-app` by one via HERDR_APP_BIN.
 # Each case runs in a clean environment (env -i) so nothing leaks from the caller's terminal.
 # Run: bash hc-a.test.sh
 set -u
@@ -22,6 +23,19 @@ exit 0
 STUB
 chmod +x "$STUB"
 
+# herdr-app is stubbed too: only `tab` uses it.
+STUB_APP="$TMP/herdr-app"
+cat >"$STUB_APP" <<'STUB'
+#!/usr/bin/env bash
+printf '<%s>\n' "$@" >> "$APP_LOG"
+key=$1
+[[ -f "$APP_DIR/$key.out" ]] && cat "$APP_DIR/$key.out"
+[[ -f "$APP_DIR/$key.err" ]] && cat "$APP_DIR/$key.err" >&2
+[[ -f "$APP_DIR/$key.rc" ]] && exit "$(cat "$APP_DIR/$key.rc")"
+exit 0
+STUB
+chmod +x "$STUB_APP"
+
 TMO=""
 if command -v timeout >/dev/null 2>&1; then TMO="timeout 15"; fi
 
@@ -35,7 +49,13 @@ fx() { # fx <key> <stdout> [stderr] [rc]
   [[ -n ${4:-} ]] && printf '%s' "$4" >"$FAKE_DIR/$1.rc"
   return 0
 }
-reset() { rm -rf "$FAKE_DIR"; mkdir -p "$FAKE_DIR"; : >"$FAKE_LOG"; }
+reset() { rm -rf "$FAKE_DIR" "$APP_DIR"; mkdir -p "$FAKE_DIR" "$APP_DIR"; : >"$FAKE_LOG"; : >"$APP_LOG"; }
+fxapp() { # fxapp <key> <stdout> [stderr] [rc]
+  printf '%s' "$2" >"$APP_DIR/$1.out"
+  [[ -n ${3:-} ]] && printf '%s' "$3" >"$APP_DIR/$1.err"
+  [[ -n ${4:-} ]] && printf '%s' "$4" >"$APP_DIR/$1.rc"
+  return 0
+}
 
 # run_a [-u VAR | VAR=value]... -- hc-a args   (clean environment, stub hc)
 run_a() {
@@ -49,6 +69,7 @@ run_a() {
   shift
   $TMO env -i ${unsets[@]+"${unsets[@]}"} PATH="$JQDIR:/usr/bin:/bin:/usr/sbin:/sbin" LANG=C \
     TMPDIR="$TMP" HC_BIN="$STUB" FAKE_DIR="$FAKE_DIR" FAKE_LOG="$FAKE_LOG" \
+    HERDR_APP_BIN="$STUB_APP" APP_DIR="$APP_DIR" APP_LOG="$APP_LOG" \
     ${assigns[@]+"${assigns[@]}"} "$HCA" "$@"
 }
 same() { [[ "$1" == "$2" ]] && pass "$3" || fail "$3" "want [$2] got [$1]"; }
@@ -58,6 +79,7 @@ rc_is(){ [[ "$1" == "$2" ]] && pass "$3" || fail "$3" "want rc $2 got $1"; }
 
 JQDIR=$(dirname "$(command -v jq)")
 FAKE_DIR="$TMP/fx"; FAKE_LOG="$TMP/args.log"; mkdir -p "$FAKE_DIR"
+APP_DIR="$TMP/fxapp"; APP_LOG="$TMP/app.log"; mkdir -p "$APP_DIR"; : >"$APP_LOG"
 
 # ------------------------------------------------------------ help without deps
 out=$(env -i PATH=/usr/bin:/bin "$HCA" --help 2>&1); rc=$?
@@ -248,6 +270,102 @@ printf '%s' '{"terminals":[{"address":"t1","agent":"a,b","state":"live","status"
 out=$(run_a -- ls)
 same "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" 2 "ls: hostile field stays on one row"
 same "$(printf '%s\n' "$out" | tail -1)" '  t1,"a,b",live,working,2,"x\ny,\"z\\w"' "ls: comma/quote/backslash/newline escaped"
+
+# --------------------------------------------------------------- tab: parent space
+SPACES='{"spaces":[{"id":"spPARENT","name":"parent","tabs":[{"id":"tbParent","name":"1","terminals":[{"terminal":"t55"}]}]},{"id":"spOTHER","name":"other","tabs":[{"id":"tbOther","name":"1","terminals":[{"terminal":"t99"}]}]}]}'
+
+reset
+fxapp ls "$SPACES"
+fxapp do '{"space":"spPARENT","tab":"tbNew","terminal":"t5g"}'
+fx get '{"address":"t55","labels":{"herdr.space":"spPARENT"}}'
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --name builder --folder /tmp --argv '["omp"]' --task 'do x' 2>&1); rc=$?
+rc_is "$rc" 0 "tab: creates a tab"
+same "$out" 't5g  space parent  tab builder
+close: herdr-app do tab.close --id tbNew --confirmed true
+report line for the task: hc send t55 "done: …"
+read: hc-a read t5g' "tab: prints the landing space and next steps"
+same "$(cat "$APP_LOG")" '<ls>
+<do>
+<tab.new>
+<--space>
+<spPARENT>
+<--name>
+<builder>
+<--folder>
+</tmp>
+<--argv>
+<["omp"]>
+<--task>
+<do x>' "tab: parent space is explicit, flags forwarded"
+
+reset
+fxapp ls "$SPACES"
+fxapp do '{"space":"spPARENT","tab":"tbNew","terminal":"t5g"}'
+fx get '{"address":"t55","labels":{}}'
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --name builder)
+has "$out" 't5g  space parent  tab builder' "tab: falls back to ls when the label is missing"
+
+reset
+fxapp ls "$SPACES"
+fxapp do '{"space":"spOTHER","tab":"tbNew","terminal":"t5h"}'
+fx get '{"address":"t55","labels":{"herdr.space":"spPARENT"}}'
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --space other --name probe)
+has "$out" 't5h  space other  tab probe' "tab: --space other wins"
+has "$(cat "$APP_LOG")" '<spOTHER>' "tab: --space name is resolved to an id"
+
+reset
+fxapp ls "$SPACES"
+fx get '{"address":"t55","labels":{"herdr.space":"spPARENT"}}'
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --space nope 2>&1); rc=$?
+rc_is "$rc" 2 "tab: unknown space is a usage error"
+same "$out" 'error: no space "nope" (herdr-app ls lists them)' "tab: unknown space message"
+hasnt "$(cat "$APP_LOG")" 'tab.new' "tab: unknown space creates nothing"
+
+reset
+fxapp ls "$SPACES"
+fxapp do '{"space":"spOTHER","tab":"tbNew","terminal":"t5g"}'
+fx get '{"address":"t55","labels":{"herdr.space":"spPARENT"}}'
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --name builder 2>&1); rc=$?
+rc_is "$rc" 1 "tab: wrong landing space fails"
+same "$out" 'error: tab created in space spOTHER, wanted spPARENT
+help: herdr-app do tab.close --id tbNew --confirmed true' "tab: mismatch names both spaces and the tab"
+
+reset
+fxapp ls "$SPACES"
+fxapp do '{"space":"spPARENT","tab":"tbMod","pane":"p1"}'
+fx get '{"address":"t55","labels":{"herdr.space":"spPARENT"}}'
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --name board --mod files --props '{"folder":"/tmp"}' 2>&1); rc=$?
+rc_is "$rc" 0 "tab: a mod tab has no terminal and still succeeds"
+same "$out" 'tbMod  space parent  tab board
+close: herdr-app do tab.close --id tbMod --confirmed true' "tab: mod tab prints no read line"
+
+reset
+fxapp ls "$SPACES"
+fxapp do '{"space":"spPARENT","tab":"tbNoTerm"}'
+fx get '{"address":"t55","labels":{"herdr.space":"spPARENT"}}'
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --name x 2>&1); rc=$?
+rc_is "$rc" 1 "tab: a terminal tab without a terminal fails"
+same "$out" 'error: tab tbNoTerm has no terminal
+help: herdr-app ls' "tab: malformed reply message"
+
+reset
+fxapp ls "$SPACES"
+out=$(run_a -- tab --name builder 2>&1); rc=$?
+rc_is "$rc" 2 "tab: outside herdr it refuses to guess"
+same "$out" 'error: cannot tell your space: run inside a herdr terminal or pass --space <id|name>' "tab: no selected-space fallback"
+
+reset
+fxapp ls '{"error":"no window"}' '' 1
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --name x 2>&1); rc=$?
+rc_is "$rc" 1 "tab: app error keeps its exit code"
+same "$out" 'error: no window
+help: herdr-app commands' "tab: app error is mapped"
+
+reset
+out=$(run_a -- tab --space 2>&1); rc=$?
+rc_is "$rc" 2 "tab: --space without a value fails cleanly"
+same "$out" 'error: --space needs a value' "tab: --space message"
+same "$(run_a -- tab extra 2>&1)" 'error: unexpected argument: extra (tab takes only flags; see hc-a --help)' "tab: positional argv is rejected"
 
 # ------------------------------------------------- usage and passthrough
 reset

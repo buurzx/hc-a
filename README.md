@@ -3,9 +3,10 @@
 Agent-facing wrapper over `hc` ([herdr-core](https://herdr.dev)): persistent terminals,
 child agents, and reports between them, shaped for a model rather than for a person.
 
-`hc-a` does not implement anything: it projects `hc` calls. Most commands are one upstream
-call; the dashboard is two (`server status`, then `ls`). The value is in three places — the
-payload, the errors, and the contract.
+`hc-a` does not implement anything: it projects upstream calls. Most commands are one `hc`
+call; the dashboard is two (`server status`, then `ls`), and `tab` is `herdr-app ls` plus
+`herdr-app do tab.new` (the window owns tabs; an `hc` terminal alone cannot make one). The
+value is in three places — the payload, the errors, and the contract.
 
 ```
 $ hc-a
@@ -45,8 +46,9 @@ export PATH="$HOME/.local/bin:$PATH"        # put this in your shell profile to 
 ```
 
 `hc-a` finds its contract through the symlink, so `--skill` works from `~/.local/bin`. Requires
-`bash` (3.2 is fine), `jq`, and `hc` on `PATH` (or `HC_BIN`). `--help` and `--skill` work
-without either, so a fresh machine can be read before anything is installed.
+`bash` (3.2 is fine), `jq`, and `hc` on `PATH` (or `HC_BIN`); `tab` also needs `herdr-app`
+(or `HERDR_APP_BIN`). `--help` and `--skill` work without any of them, so a fresh machine can
+be read before anything is installed.
 
 ## Commands
 
@@ -59,6 +61,7 @@ without either, so a fresh machine can be read before anything is installed.
 | `hc-a send <t> "text" [--wait]` | steer it; with `--wait`, reports how the turn ended |
 | `hc-a wait [<t>] [--children any\|all]` | blocks in the core; prints `reason`, so a timeout check-in is not mistaken for an exit |
 | `hc-a run [--name N] [--cwd P] cmd…` | start a terminal; prints the report line to put in its task |
+| `hc-a tab [--space S] [--name N] [--folder P] [--argv JSON] [--task T]` | a visible tab in **your** space (default); `--space <id\|name>` to override; checks where it landed |
 | `hc-a exec -- cmd…` | no terminal; text out, exit code kept |
 | `hc-a kill <t>` / `rm <t>` / `label <t> k=v…` | lifetime, labels |
 | `hc-a templates\|machines` | roles, remote machines |
@@ -117,15 +120,17 @@ A child that dies or blocks without reporting raises its own note
 ## Tests
 
 ```sh
-bash hc-a.test.sh      # 58 assertions, no herdr, no network
+bash hc-a.test.sh      # 80 assertions, no herdr, no network
 ```
 
-`hc` is replaced by a stub through `HC_BIN`, so every test is deterministic and runs anywhere.
+`hc` is replaced by a stub through `HC_BIN` and `herdr-app` by one through `HERDR_APP_BIN`,
+so every test is deterministic and runs anywhere.
 Each test pins a real defect found in review: exit codes lost through command substitution,
 `--json` leaking into a child's argv after `--`, `wait` hiding `reason`/`children`/`from`,
 `send --wait` dropping its outcome, an unsent first message staying invisible, `read` dumping
 the whole screen, raw JSON errors, missing `<t>`, missing flag values, a dead core exiting 0,
-and TOON fields broken by commas, quotes, backslashes or newlines.
+TOON fields broken by commas, quotes, backslashes or newlines, and a tab landing in the
+window's selected space instead of the caller's.
 
 ## License
 
