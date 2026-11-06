@@ -5,7 +5,7 @@
 # Run: bash hc-a.test.sh
 set -u
 
-HCA="$(cd "$(dirname "$0")" && pwd)/hc-a"
+HCA="$(CDPATH= cd "$(dirname "$0")" && pwd)/hc-a"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/hca-test.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
@@ -82,22 +82,50 @@ FAKE_DIR="$TMP/fx"; FAKE_LOG="$TMP/args.log"; mkdir -p "$FAKE_DIR"
 APP_DIR="$TMP/fxapp"; APP_LOG="$TMP/app.log"; mkdir -p "$APP_DIR"; : >"$APP_LOG"
 
 # ------------------------------------------------------------ help without deps
-out=$(env -i PATH=/usr/bin:/bin "$HCA" --help 2>&1); rc=$?
+# /usr/bin:/bin still contains jq on macOS, so "no jq" needs a PATH built by hand.
+MINBIN="$TMP/minbin"; mkdir -p "$MINBIN"
+for b in bash env cat sed awk readlink dirname; do ln -sf "$(command -v "$b")" "$MINBIN/$b"; done
+if env -i PATH="$MINBIN" /bin/sh -c 'command -v jq || command -v hc' >/dev/null 2>&1; then
+  fail "help: minimal PATH excludes jq and hc" "jq or hc still resolves"
+else
+  pass "help: minimal PATH excludes jq and hc"
+fi
+
+out=$(env -i PATH="$MINBIN" "$HCA" --help 2>&1); rc=$?
 rc_is "$rc" 0 "help: works with no jq and no hc"
 has "$out" "hc-a — agent view of hc" "help: prints usage"
+
+# `hc-a <cmd> --help` is what an agent tries after a subcommand; it must answer, not fail.
+for sub in tab read run send wait ls get kill dashboard rm label exec templates machines; do
+  out=$(env -i PATH="$MINBIN" "$HCA" "$sub" --help 2>&1); rc=$?
+  rc_is "$rc" 0 "help: $sub --help needs no jq and no hc"
+  has "$out" "hc-a tab [--report] [--space S]" "help: $sub --help prints the usage"
+done
+out=$(env -i PATH="$MINBIN" "$HCA" tab -h 2>&1); rc=$?
+rc_is "$rc" 0 "help: -h after a subcommand works"
+out=$(run_a -- tab --name x --help 2>&1); rc=$?
+rc_is "$rc" 0 "help: --help after other flags works"
+out=$(run_a -- tab --bogus 2>&1); rc=$?
+rc_is "$rc" 2 "help: unknown flag is a usage error"
+same "$out" 'error: unknown flag --bogus (see hc-a --help)' "help: unknown flag names the manual"
 
 mkdir -p "$TMP/inst/bin" "$TMP/inst/repo"
 cp "$HCA" "$TMP/inst/repo/hc-a"
 printf -- '---\nname: x\n---\nBODY-LINE\n' >"$TMP/inst/repo/SKILL.md"
 ln -sf ../repo/hc-a "$TMP/inst/bin/hc-a"
-out=$(env -i PATH=/usr/bin:/bin "$TMP/inst/bin/hc-a" --skill 2>&1); rc=$?
+out=$(env -i PATH="$MINBIN" "$TMP/inst/bin/hc-a" --skill 2>&1); rc=$?
 rc_is "$rc" 0 "skill: works with no jq and no hc"
 has "$out" "BODY-LINE" "skill: found through the install symlink"
 hasnt "$out" "name: x" "skill: front matter stripped"
 
 mkdir -p "$TMP/alone"; cp "$HCA" "$TMP/alone/hc-a"
-out=$(env -i PATH=/usr/bin:/bin "$TMP/alone/hc-a" --skill 2>&1)
+out=$(env -i PATH="$MINBIN" "$TMP/alone/hc-a" --skill 2>&1)
 has "$out" "standalone install" "skill: incomplete standalone fallback"
+
+# CDPATH makes `cd` print its destination, which used to corrupt the script directory.
+repo=$(CDPATH= cd "$(dirname "$HCA")" && pwd); parent=$(dirname "$repo"); name=$(basename "$repo")
+out=$( (cd "$parent" && CDPATH="$parent" /bin/bash "$name/hc-a" --skill) 2>&1 )
+hasnt "$out" "standalone install" "skill: CDPATH does not corrupt the script directory"
 
 # ---------------------------------------------------------------- P1.1 run rc
 reset
@@ -141,6 +169,10 @@ reset
 fx wait '{"terminal":"t5","reason":"message","status":"working","ended":false,"exit_code":null,"from":"t7"}'
 out=$(run_a -- wait t5)
 same "$out" 't5  message  status: working  ended: false  exit: -  from: t7' "wait: reason and from are rendered"
+run_a -- wait t5 --children all --timeout 5 >/dev/null
+has "$(cat "$FAKE_LOG")" '<all>
+<--timeout>
+<5>' "wait: --children and --timeout are forwarded"
 
 reset
 fx wait '{"terminal":"t5","reason":"timeout","status":null,"ended":false,"children":[{"terminal":"t6","reason":"exit","status":null,"ended":true,"exit_code":0},{"terminal":"t7","reason":"running","status":"working","ended":false}]}'
@@ -152,16 +184,72 @@ same "$out" 't5  timeout  status: -  ended: false  exit: -
 # --------------------------------------------------------- P1.3 send --wait
 reset
 fx send '{"started":true,"status":"done","turn":3,"wait":{"reason":"not_started","status":null}}'
-out=$(run_a -- send t5 'hello')
-same "$out" 'sent: true  was: done (turn 3)  → not_started  -' "send: --wait outcome is not dropped"
+out=$(run_a -- send t5 'hello' --wait)
+same "$out" 'sent: true  started: true  was: done (turn 3)  → not_started  -' "send: --wait outcome is not dropped"
+has "$(cat "$FAKE_LOG")" '<--wait>' "send: --wait is forwarded to hc"
+
+reset
+fx send '{"started":null,"status":null,"turn":0}'
+same "$(run_a -- send t5 'hello')" 'sent: true  started: -  was: - (turn 0)' "send: plain program still reads as sent"
 
 # ------------------------------------------------------- P1.4 first_message
 reset
 fx run '{"address":"t9","state":"live","agent":"claude","cwd":"/tmp","name":"fix","first_message":{"sent":false,"reason":"readiness"}}'
-out=$(run_a HC_TERMINAL_ID=t55 -- run --name fix claude 'do x')
+out=$(run_a HC_TERMINAL_ID=t55 -- run --name fix claude 'do x' 2>/dev/null)
 has "$out" 'FIRST MESSAGE NOT SENT: readiness' "run: unsent first message is flagged"
 has "$out" 'hc send t55' "run: prints the caller's report line"
 has "$out" '/tmp/fix.report.md' "run: prints the fallback report path"
+
+# `--report` is explicit: it appends the contract line instead of guessing argv.
+reset
+fx run '{"address":"t9","state":"live","agent":"claude","cwd":"/tmp","name":"x"}'
+out=$(run_a HC_TERMINAL_ID=t55 -- run --report --name x claude 'do x' 2>&1); rc=$?
+rc_is "$rc" 0 "run: --report succeeds"
+log=$(cat "$FAKE_LOG")
+has "$log" 'Report when done or stuck: hc send t55' "run: --report appends the report line"
+has "$log" '/tmp/x-' "run: --report names a unique fallback file"
+has "$out" '/tmp/x-' "run: output names the injected fallback"
+p1=$(printf '%s\n' "$out" | sed -n 's/^fallback: write \(.*\) if hc send fails$/\1/p')
+t1=$(sed -n 's/^.*If hc send fails, write \(.*\) and print the path.*$/\1/p' "$FAKE_LOG" | head -1)
+same "$p1" "$t1" "run: output and task share the fallback path"
+out=$(run_a HC_TERMINAL_ID=t55 -- run --report claude 2>&1); rc=$?
+rc_is "$rc" 2 "run: --report without a task is a usage error"
+same "$out" 'error: --report needs a program and a task' "run: --report task message"
+out=$(run_a HC_TERMINAL_ID=t55 -- run --report -- probe 2>&1); rc=$?
+rc_is "$rc" 2 "run: --report after -- with no task is rejected"
+out=$(run_a HC_TERMINAL_ID=t55 -- run --report probe '' 2>&1); rc=$?
+rc_is "$rc" 2 "run: --report with an empty task is rejected"
+same "$out" 'error: --report needs a non-empty task' "run: empty task message"
+out=$(run_a -- run --report claude 'do x' 2>&1); rc=$?
+rc_is "$rc" 2 "run: --report outside herdr is a usage error"
+same "$out" 'error: --report needs a herdr terminal ($HC_TERMINAL_ID)' "run: --report terminal message"
+
+reset
+fx run '{"address":"t9","state":"live","agent":"claude","cwd":"/tmp","name":"x"}'
+out=$(run_a HC_TERMINAL_ID=t55 -- run --outlive-parent --report probe task 2>&1); rc=$?
+rc_is "$rc" 0 "run: --report after an upstream flag succeeds"
+same "$(grep -c 'Report when done or stuck' "$FAKE_LOG")" 1 "run: --report appends exactly once"
+has "$(cat "$FAKE_LOG")" '<task' "run: --report keeps the task argument"
+same "$(grep -A1 '^<probe>$' "$FAKE_LOG" | tail -n 1 | cut -c1-5)" '<task' "run: --report appends to the task, not the executable"
+out=$(run_a HC_TERMINAL_ID=t55 -- run --report --name x claude 'do x' 2>&1)
+p2=$(printf '%s\n' "$out" | sed -n 's/^fallback: write \(.*\) if hc send fails$/\1/p')
+[[ -n $p1 && -n $p2 && $p1 != "$p2" ]] && pass "run: two launches get distinct fallback paths" || fail "run: two launches get distinct fallback paths" "p1=[$p1] p2=[$p2]"
+out=$(run_a -- run --name= /bin/pwd 2>&1); rc=$?
+rc_is "$rc" 2 "run: attached empty --name is rejected"
+same "$out" 'error: --name needs a value' "run: attached empty --name message"
+out=$(run_a -- run --cwd= /bin/pwd 2>&1); rc=$?
+rc_is "$rc" 2 "run: attached empty --cwd is rejected"
+out=$(run_a -- run --no-notify --name= /bin/pwd 2>&1); rc=$?
+rc_is "$rc" 2 "run: empty --name after an upstream flag is rejected"
+out=$(run_a -- run --no-notify --cwd= /bin/pwd 2>&1); rc=$?
+rc_is "$rc" 2 "run: empty --cwd after an upstream flag is rejected"
+out=$(run_a -- run --no-notify --name '' /bin/pwd 2>&1); rc=$?
+rc_is "$rc" 2 "run: separate empty --name after an upstream flag is rejected"
+
+reset
+fx run '{"address":"t9","state":"live","agent":"claude","cwd":"/tmp","name":"x"}'
+run_a HC_TERMINAL_ID=t55 -- run --name x claude 'do x' >/dev/null 2>&1
+hasnt "$(cat "$FAKE_LOG")" 'Report when done' "run: without --report the task is untouched"
 
 reset
 fx get '{"address":"t9","state":"live","cwd":"/tmp","argv":["claude"],"first_message":{"sent":false,"reason":"readiness"}}'
@@ -172,8 +260,52 @@ has "$out" 'FIRST MESSAGE NOT SENT: readiness' "get: unsent first message is fla
 reset
 seq 1 100 >"$FAKE_DIR/read.out"
 same "$(run_a -- read t5 | wc -l | tr -d ' ')" 60 "read: default keeps the last 60 lines"
+same "$(sed -n '3,4p' "$FAKE_LOG")" '<--lines>
+<60>' "read: default asks for 60 history lines above the screen"
 same "$(run_a -- read t5 --tail 0 | wc -l | tr -d ' ')" 100 "read: --tail 0 keeps the whole screen"
+same "$(tail -n 2 "$FAKE_LOG")" '<--lines>
+<0>' "read: --tail 0 asks for no history"
 same "$(run_a -- read t5 --tail 5 | wc -l | tr -d ' ')" 5 "read: --tail N"
+same "$(tail -n 2 "$FAKE_LOG")" '<--lines>
+<5>' "read: --tail N asks for N history lines"
+run_a -- read t5 --lines 7 --tail 3 >/dev/null
+same "$(tail -n 2 "$FAKE_LOG")" '<--lines>
+<7>' "read: explicit --lines wins over --tail"
+
+# Command substitution strips trailing newlines: read must stream through a file instead.
+reset
+printf 'old\nnew\n\n\n' >"$FAKE_DIR/read.out"
+printf 'old\nnew\n\n\n' >"$TMP/want0"; printf '\n\n' >"$TMP/want2"
+run_a -- read t5 --tail 0 >"$TMP/tail0"
+cmp -s "$TMP/tail0" "$TMP/want0" && pass "read: --tail 0 keeps trailing blank lines" || fail "read: --tail 0 keeps trailing blank lines"
+run_a -- read t5 --tail 2 >"$TMP/tail2"
+cmp -s "$TMP/tail2" "$TMP/want2" && pass "read: --tail 2 keeps the blank lines it selects" || fail "read: --tail 2 keeps the blank lines it selects"
+reset
+printf 'a\0b\r\nc\n' >"$FAKE_DIR/read.out"
+printf 'a\0b\r\nc\n' >"$TMP/rawwant"
+run_a -- read t5 --tail 0 >"$TMP/raw"
+cmp -s "$TMP/raw" "$TMP/rawwant" && pass "read: NUL and CR bytes are preserved" || fail "read: NUL and CR bytes are preserved"
+
+# tail would treat +2 and 00 as modes; only unsigned decimal counts.
+reset
+seq 1 100 >"$FAKE_DIR/read.out"
+out=$(run_a -- read t5 --tail +2 2>&1); rc=$?
+rc_is "$rc" 2 "read: --tail +2 is rejected"
+same "$out" 'error: --tail needs a non-negative number' "read: --tail rejects a sign"
+run_a -- read t5 --tail 00 >"$TMP/tail00"
+same "$(wc -l <"$TMP/tail00" | tr -d ' ')" 100 "read: --tail 00 means zero"
+out=$(run_a -- read t5 --tail 1000001 2>&1); rc=$?
+rc_is "$rc" 2 "read: tail over the limit is rejected"
+same "$out" 'error: --tail is too large (max 1000000)' "read: tail limit message"
+out=$(run_a -- read t5 --lines 18446744073709551616 --tail 0 2>&1); rc=$?
+rc_is "$rc" 2 "read: lines overflow is rejected"
+mkdir -p "$TMP/nomktemp"
+printf '#!/bin/sh\nexit 1\n' >"$TMP/nomktemp/mktemp"; chmod +x "$TMP/nomktemp/mktemp"
+out=$(env -i PATH="$TMP/nomktemp:$JQDIR:/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR="$TMP" \
+  HC_BIN="$STUB" HC_TERMINAL_ID=t55 "$HCA" read t5 2>&1); rc=$?
+rc_is "$rc" 1 "read: temp allocation failure stops cleanly"
+has "$out" 'error: cannot create a temporary file' "read: temp allocation message"
+hasnt "$out" 'help: hc read t5' "read: temp allocation does not fake a core error"
 
 # ------------------------------------------------------- P2.1 read error path
 reset
@@ -192,6 +324,14 @@ rc_is "$rc" 5 "mixed stderr: exit code preserved"
 has "$out" 'error: cannot start core' "mixed stderr: structured error extracted"
 has "$out" 'help: check the core log' "mixed stderr: hint survives"
 hasnt "$out" '"error"' "mixed stderr: no raw JSON leaked"
+
+reset
+fx ls '' '{"error":{"message":"first","hint":"h1"}}
+{"error":{"message":"second","hint":"h2"}}' 4
+out=$(run_a -- ls 2>&1); rc=$?
+rc_is "$rc" 4 "mixed stderr: latest error keeps the exit code"
+same "$out" 'error: second
+help: h2' "mixed stderr: the last structured error wins"
 
 # ------------------------------------------------------- P2.2 missing values
 reset
@@ -232,6 +372,25 @@ fx ls '{"terminals":[{"address":"t1","agent":"zsh","state":"live","status":null,
 err=$(run_a -- dashboard 2>&1 >/dev/null)
 same "$err" '' "dashboard: nothing on stderr on the happy path"
 
+reset
+fx status '{"version":"0.1.18","pid":1,"live":1,"finished":0}'
+fx ls '{"terminals":[{"address":"t55","agent":"omp","state":"live","status":"working","turn":1,"where":"a / 1"}]}'
+out=$(run_a HC_TERMINAL_ID=t55 -- dashboard 2>&1)
+has "$out" 'working: t55 — read it' "dashboard: working self does not promise a report"
+hasnt "$out" 'wait for their report' "dashboard: no blanket wait instruction"
+
+reset
+fx status 'not json'
+out=$(run_a -- dashboard 2>&1); rc=$?
+rc_is "$rc" 1 "dashboard: invalid status JSON fails"
+has "$out" 'error: invalid JSON from hc server status' "dashboard: invalid status message"
+reset
+fx status '{"version":"0.1.18","pid":1,"live":0,"finished":0}'
+fx ls '[]'
+out=$(run_a -- dashboard 2>&1); rc=$?
+rc_is "$rc" 1 "dashboard: non-object ls JSON fails"
+has "$out" 'error: invalid JSON from hc ls' "dashboard: invalid ls message"
+
 # --------------------------------------------------------- missing surfaces
 reset
 fx ls '{"terminals":[]}'
@@ -246,9 +405,36 @@ same "$out" 'out-line' "exec: stdout passes through"
 same "$(cat "$TMP/e")" 'err-line' "exec: stderr passes through"
 
 reset
+fx exec 'ok'
+out=$(run_a -- exec -- --help 2>&1); rc=$?
+rc_is "$rc" 0 "exec: delimiter is forwarded"
+same "$(cat "$FAKE_LOG")" '<exec>
+<-->
+<--help>' "exec: --help stays an operand"
+
+reset
 out=$(run_a -- nope 2>&1); rc=$?
 rc_is "$rc" 2 "unknown command: rc 2"
 has "$out" 'error: unknown command nope' "unknown command: message"
+
+# Silently ignored arguments made an agent believe a filter was honored.
+reset
+out=$(run_a -- ls --bogus 2>&1); rc=$?
+rc_is "$rc" 2 "ls: unknown flag is rejected"
+same "$out" 'error: unexpected argument: --bogus (ls takes only --all; see hc-a --help)' "ls: unknown flag message"
+out=$(run_a -- ls --all --bogus 2>&1); rc=$?
+rc_is "$rc" 2 "ls: unknown flag after --all is rejected"
+out=$(run_a -- get t5 extra 2>&1); rc=$?
+rc_is "$rc" 2 "get: extra argument is rejected"
+same "$out" 'error: unexpected argument: extra (get takes one terminal; see hc-a --help)' "get: extra argument message"
+out=$(run_a -- get --bogus 2>&1); rc=$?
+rc_is "$rc" 2 "get: unknown flag is rejected"
+out=$(run_a -- templates --bogus 2>&1); rc=$?
+rc_is "$rc" 2 "templates: extra argument is rejected"
+out=$(run_a -- machines x 2>&1); rc=$?
+rc_is "$rc" 2 "machines: extra argument is rejected"
+out=$(run_a -- dashboard x 2>&1); rc=$?
+rc_is "$rc" 2 "dashboard: extra argument is rejected"
 
 reset
 fx get '' '{"error":{"kind":"not_found","message":"no terminal \"zz\"","hint":"see `hc ls --all`"}}' 3
@@ -284,19 +470,12 @@ same "$out" 't5g  space parent  tab builder
 close: herdr-app do tab.close --id tbNew --confirmed true
 report line for the task: hc send t55 "done: …"
 read: hc-a read t5g' "tab: prints the landing space and next steps"
-same "$(cat "$APP_LOG")" '<ls>
-<do>
-<tab.new>
-<--space>
-<spPARENT>
-<--name>
-<builder>
-<--folder>
-</tmp>
-<--argv>
-<["omp"]>
-<--task>
-<do x>' "tab: parent space is explicit, flags forwarded"
+payload=$(sed -n '4p' "$APP_LOG" | sed 's/^<//; s/>$//')
+same "$(jq -r '.space' <<<"$payload")" spPARENT "tab: payload carries the resolved space"
+same "$(jq -r '.name' <<<"$payload")" builder "tab: payload keeps the name string"
+same "$(jq -r '.folder' <<<"$payload")" /tmp "tab: payload keeps the folder"
+same "$(jq -r '.argv | join(",")' <<<"$payload")" omp "tab: payload keeps argv"
+same "$(jq -r '.task' <<<"$payload")" 'do x' "tab: payload keeps the task"
 
 reset
 fxapp ls "$SPACES"
@@ -311,7 +490,8 @@ fxapp do '{"space":"spOTHER","tab":"tbNew","terminal":"t5h"}'
 fx get '{"address":"t55","labels":{"herdr.space":"spPARENT"}}'
 out=$(run_a HC_TERMINAL_ID=t55 -- tab --space other --name probe)
 has "$out" 't5h  space other  tab probe' "tab: --space other wins"
-has "$(cat "$APP_LOG")" '<spOTHER>' "tab: --space name is resolved to an id"
+payload=$(sed -n '4p' "$APP_LOG" | sed 's/^<//; s/>$//')
+same "$(jq -r '.space' <<<"$payload")" spOTHER "tab: --space name is resolved to an id"
 
 reset
 fxapp ls "$SPACES"
@@ -338,6 +518,9 @@ out=$(run_a HC_TERMINAL_ID=t55 -- tab --name board --mod files --props '{"folder
 rc_is "$rc" 0 "tab: a mod tab has no terminal and still succeeds"
 same "$out" 'tbMod  space parent  tab board
 close: herdr-app do tab.close --id tbMod --confirmed true' "tab: mod tab prints no read line"
+payload=$(sed -n '4p' "$APP_LOG" | sed 's/^<//; s/>$//')
+same "$(jq -c '.props' <<<"$payload")" '{"folder":"/tmp"}' "tab: mod props reach the payload"
+same "$(jq -r '.mod' <<<"$payload")" files "tab: mod kind reaches the payload"
 
 reset
 fxapp ls "$SPACES"
@@ -350,6 +533,70 @@ help: herdr-app ls' "tab: malformed reply message"
 
 reset
 fxapp ls "$SPACES"
+fxapp do '{"space":"spPARENT","tab":"tbNew","terminal":"t5g"}'
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --report --name builder --argv '["codex","exec"]' --task 'do x' 2>&1); rc=$?
+rc_is "$rc" 0 "tab: --report succeeds"
+log=$(cat "$APP_LOG")
+has "$log" 'Report when done or stuck: hc send t55' "tab: --report appends the report line"
+has "$log" '/tmp/builder-' "tab: --report uses a unique fallback file"
+has "$out" '/tmp/builder-' "tab: output names the injected fallback"
+pt1=$(printf '%s\n' "$out" | sed -n 's/^fallback: write \(.*\) if hc send fails$/\1/p')
+tt1=$(sed -n 's/^.*If hc send fails, write \(.*\) and print the path.*$/\1/p' "$APP_LOG" | head -1)
+same "$pt1" "$tt1" "tab: output and task share the fallback path"
+same "$(grep -c 'Report when done or stuck' "$APP_LOG")" 1 "tab: --report appends exactly once"
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --report --name builder --argv '["codex","exec"]' --task 'do x' 2>&1)
+pt2=$(printf '%s\n' "$out" | sed -n 's/^fallback: write \(.*\) if hc send fails$/\1/p')
+[[ -n $pt1 && -n $pt2 && $pt1 != "$pt2" ]] && pass "tab: two launches get distinct fallback paths" || fail "tab: two launches get distinct fallback paths" "pt1=[$pt1] pt2=[$pt2]"
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --report --name x 2>&1); rc=$?
+rc_is "$rc" 2 "tab: --report without --task is a usage error"
+same "$out" 'error: --report needs --task' "tab: --report task message"
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --report --mod files --task task 2>&1); rc=$?
+rc_is "$rc" 2 "tab: --report with --mod is rejected"
+same "$out" 'error: --report cannot be used with --mod' "tab: --report mod message"
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --report --name 'a/b' --argv '["probe"]' --task task 2>&1); rc=$?
+rc_is "$rc" 0 "tab: --report accepts a slash display name"
+hasnt "$(cat "$APP_LOG")" 'a/b.report.md' "tab: slash name does not become a path"
+has "$(cat "$APP_LOG")" '/tmp/child-' "tab: unsafe name uses the flat fallback"
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --name eq --task='- Fix bug' 2>&1); rc=$?
+rc_is "$rc" 0 "tab: attached --task value is accepted"
+has "$(cat "$APP_LOG")" '"- Fix bug"' "tab: attached --task keeps its leading dash"
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --name=123 --argv '["true"]' --task=null 2>&1); rc=$?
+rc_is "$rc" 0 "tab: numeric-looking strings still launch"
+payload=$(tail -n 1 "$APP_LOG" | sed 's/^<//; s/>$//')
+same "$(jq -r '.name | type' <<<"$payload")" string "tab: name 123 stays a string"
+same "$(jq -r '.task | type' <<<"$payload")" string "tab: task null stays a string"
+same "$(jq -r '.task' <<<"$payload")" null "tab: task null keeps its text"
+long=$(printf '%250s' '' | tr ' ' a)
+reset
+fxapp ls "$SPACES"
+fxapp do '{"space":"spPARENT","tab":"tbNew","terminal":"t5g"}'
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --report --name "$long" --argv '["probe"]' --task task 2>&1); rc=$?
+rc_is "$rc" 0 "tab: oversized display name still launches"
+has "$(cat "$APP_LOG")" '/tmp/child-' "tab: oversized name uses the flat child fallback"
+hasnt "$(cat "$APP_LOG")" "/tmp/$long" "tab: oversized name is not embedded in the fallback path"
+out=$(run_a -- tab --report --name x --task 'do x' 2>&1); rc=$?
+rc_is "$rc" 2 "tab: --report outside herdr is a usage error"
+
+reset
+fxapp ls "$SPACES"
+fxapp do '{"space":"spPARENT","tab":"tbNew","terminal":"t5g"}'
+run_a HC_TERMINAL_ID=t55 -- tab --name plain --argv '["omp"]' --task 'do x' >/dev/null 2>&1
+hasnt "$(cat "$APP_LOG")" 'Report when done' "tab: without --report the task is untouched"
+
+for bad in '[null,"codex"]' '{"0":"codex"}' 'not-json' '[]' '[null] ["codex"]'; do
+  out=$(run_a HC_TERMINAL_ID=t55 -- tab --name bad --argv "$bad" 2>&1); rc=$?
+  rc_is "$rc" 2 "tab: invalid --argv is rejected [$bad]"
+done
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --name bad --argv --task 2>&1); rc=$?
+rc_is "$rc" 2 "tab: --argv before another flag is a missing value"
+same "$out" 'error: --argv needs a value' "tab: --argv missing value message"
+out=$(run_a HC_TERMINAL_ID=t55 -- tab --name bad --task --argv 2>&1); rc=$?
+rc_is "$rc" 2 "tab: --task before another flag is a missing value"
+same "$out" 'error: --task needs a value' "tab: --task missing value message"
+
+reset
+fxapp ls "$SPACES"
+fx get '{"address":"t55","labels":{"herdr.space":"spPARENT"}}'
 out=$(run_a -- tab --name builder 2>&1); rc=$?
 rc_is "$rc" 2 "tab: outside herdr it refuses to guess"
 same "$out" 'error: cannot tell your space: run inside a herdr terminal or pass --space <id|name>' "tab: no selected-space fallback"
@@ -378,6 +625,22 @@ fx kill 'removed t5' '' 0
 out=$(run_a -- kill t5 2>&1); rc=$?
 rc_is "$rc" 0 "kill: non-JSON output passes through"
 same "$out" 'removed t5' "kill: raw text kept"
+
+reset
+fx rm '{"removed":"t5"}'
+out=$(run_a -- rm t5 2>&1); rc=$?
+rc_is "$rc" 0 "rm: json output passes through"
+same "$out" '{"removed":"t5"}' "rm: compact json kept"
+has "$(cat "$FAKE_LOG")" '<rm>
+<t5>' "rm: reaches hc"
+
+reset
+fx label '{"labels":{"a":"b"}}'
+out=$(run_a -- label t5 a=b 2>&1); rc=$?
+rc_is "$rc" 0 "label: json output passes through"
+has "$(cat "$FAKE_LOG")" '<label>
+<t5>
+<a=b>' "label: pairs reach hc"
 
 printf '\n%d passed, %d failed\n' "$passn" "$failn"
 [[ $failn == 0 ]]

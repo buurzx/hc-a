@@ -27,9 +27,9 @@ terminals[2]{address,agent,state,status,turn,where}:
   t2q,omp,live,done,287,t-monitor / coordinator
   *t55,omp,live,working,3,agentic-system / 2
 help[4]:
-  working: t55 — end your turn and wait for their report
-  hc-a run --cwd DIR --name NAME claude "task + report line" — delegate
-  hc-a tab --name NAME --argv '["claude"]' --task "…" — own space
+  working: t55 — read it; wait only for a child you started
+  hc-a run --report --cwd DIR --name NAME claude "task" — delegate
+  hc-a tab --report --name NAME --argv '["claude"]' --task "…" — own space
   hc-a --skill — the contract
 ```
 
@@ -40,9 +40,13 @@ full JSON. `hc-a` gives it one compact view and one rule:
 
 > **A child you told to report never needs waiting.**
 
+`hc-a run --report` and `hc-a tab --report` append the line themselves — to the last run
+argument or to `--task` — including a fallback file for a sandboxed child. Without the flag,
+put the same line in the task yourself; a launch with no report line is a child you will have
+to read or wait for.
+
 ```sh
-hc-a run --cwd ~/proj --name api claude \
-  'Add pagination to /users. Report when done or stuck: hc send t55 "done: ..."'
+hc-a run --report --cwd ~/proj --name api claude 'Add pagination to /users.'
 # t5a  live  claude  /Users/me/proj  name=api
 # report line for the task: hc send t55 "done: …"
 # read: hc-a read t5a
@@ -51,8 +55,9 @@ hc-a run --cwd ~/proj --name api claude \
 Do your own work. When nothing is left, end your turn — the report wakes you. A child that
 dies or blocks without reporting raises its own note (`<hc>t5a api exited (signal 9)</hc>`),
 provided notes are enabled (`notes = false` in `~/.config/herdr-core/config.toml` and
-`hc run --no-notify` disable them). A sandboxed child may be unable to run `hc send` at all,
-so name a fallback file in its task; if nothing arrives, `hc-a read <t>` and look there.
+`hc run --no-notify` disable them). A sandboxed child may be unable to run `hc send` at all;
+`--report` names `/tmp/<name>-<pid>-<n>.report.md` as its fallback, so `hc-a read <t>` finds it if
+nothing arrives.
 
 ## Requirements
 
@@ -62,8 +67,8 @@ so name a fallback file in its task; if nothing arrives, `hc-a read <t>` and loo
 - `herdr-app` for `hc-a tab` (it ships with the Herdr desktop app).
 - Optional: an agent CLI such as `claude`, `codex`, `opencode`, `pi` or `omp` for delegation.
 
-`--help` and `--skill` work without any dependency, so a fresh machine can read the contract
-before installing anything.
+`--help` (also as `hc-a <cmd> --help`) and `--skill` work without any dependency, so a fresh
+machine can read the contract before installing anything.
 
 ## Install
 
@@ -87,8 +92,8 @@ export PATH="$HOME/.local/bin:$PATH"        # put this in your shell profile to 
 | `hc-a read [<t>] [--tail N]` | what it printed; default last 60 lines, `--tail 0` = whole screen |
 | `hc-a send <t> "text" [--wait]` | steer it; with `--wait`, reports how the turn ended |
 | `hc-a wait [<t>] [--children any\|all]` | blocks in the core; prints `reason`, so a timeout check-in is not mistaken for an exit |
-| `hc-a run [--name N] [--cwd P] cmd…` | start a terminal; prints the report line to put in its task |
-| `hc-a tab [--space S] [--name N] [--folder P] [--argv JSON] [--task T]` | a visible tab in **your** space (default); `--space <id\|name>` to override; checks where it landed |
+| `hc-a run [--report] [--name N] [--cwd P] cmd…` | start a terminal; `--report` appends the report line and fallback file to the task |
+| `hc-a tab [--report] [--space S] [--name N] [--folder P] [--argv JSON] [--task T]` | a visible tab in **your** space (default); `--space <id\|name>` to override; `--report` appends the report line to `--task`; checks where it landed |
 | `hc-a exec -- cmd…` | no terminal; text out, exit code kept |
 | `hc-a kill <t>` / `rm <t>` / `label <t> k=v…` | lifetime, labels |
 | `hc-a templates\|machines` | roles, remote machines |
@@ -102,7 +107,7 @@ not a terminal. Text after a dash (`--help`) is sent as data, not read as an opt
 `hc-a run` places terminals in your own tab. For a visible separate tab use `hc-a tab`:
 
 ```sh
-hc-a tab --name builder --folder "$PWD" --argv '["claude"]' --task "do X"
+hc-a tab --report --name builder --folder "$PWD" --argv '["claude"]' --task "do X"
 # t5g  space t-monitor  tab builder
 # close: herdr-app do tab.close --id tb… --confirmed true
 # report line for the task: hc send t55 "done: …"
@@ -111,6 +116,8 @@ hc-a tab --name builder --folder "$PWD" --argv '["claude"]' --task "do X"
 
 The tab goes in **your own space** — the space of the terminal you are running in — so it
 stays with the parent. Pass `--space <id|name>` only to deliberately put it elsewhere.
+`--report` needs `--task`: a tab whose prompt lives only in `--argv` must carry the report
+line inside that prompt. The fallback path is unique per child and shown in the output.
 
 Do not call `herdr-app do tab.new` directly for this: without `--space` it uses the space
 *selected in the window*, which may be someone else's. `--folder` is only the working
@@ -144,7 +151,7 @@ arrive as `{"error":{kind,message,hint}}` on stderr — sometimes after a startu
 ## Tests
 
 ```sh
-bash hc-a.test.sh      # 80 assertions, no herdr, no network
+bash hc-a.test.sh      # 221 assertions, no herdr, no network
 ```
 
 `hc` is replaced by a stub through `HC_BIN` and `herdr-app` by one through `HERDR_APP_BIN`,

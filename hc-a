@@ -13,11 +13,11 @@ APP="${HERDR_APP_BIN:-herdr-app}"
 resolve_self() {
   local src=$0 dir
   while [[ -L $src ]]; do
-    dir=$(cd "$(dirname "$src")" && pwd)
+    dir=$(CDPATH= cd -- "$(dirname "$src")" && pwd)
     src=$(readlink "$src")
     case $src in /*) ;; *) src=$dir/$src ;; esac
   done
-  cd "$(dirname "$src")" && pwd
+  CDPATH= cd -- "$(dirname "$src")" && pwd
 }
 HERE=$(resolve_self)
 
@@ -33,14 +33,16 @@ hc-a — agent view of hc (herdr-core)
   hc-a read [<t>] [--lines N] [--tail N]   screen + history (default: last 60 lines)
   hc-a send <t> <text> [--wait] [--force]
   hc-a wait [<t>] [--children any|all] [--timeout N] [--output X]
-  hc-a run [--name N] [--cwd P] <cmd...>   run in a new terminal, print its address
-  hc-a tab [--space S] [--name N] [--folder P] [--argv JSON] [--task T]
+  hc-a run [--report] [--name N] [--cwd P] <cmd...>   run in a new terminal
+  hc-a tab [--report] [--space S] [--name N] [--folder P] [--argv JSON] [--task T]
                              new tab in YOUR space by default; --space to override
   hc-a exec -- <cmd...>      run without a terminal; text out, exit code kept
   hc-a kill <t> | rm <t> | label <t> k=v...
   hc-a templates | machines
   hc-a --skill               the contract for agents
 
+--report appends "Report when done or stuck: hc send <you> …" to the task: the last
+run argument, or the tab --task. A child told to report needs no waiting.
 <t> = address (t7), name, or machine/t7. Default for get/read/wait: your own terminal
 ($HC_TERMINAL_ID). send always needs one. Run `hc-a --skill` for the workflow contract.
 EOF
@@ -59,8 +61,8 @@ skill() {
 The full contract ships as SKILL.md beside the script and is missing here, so this is only
 what you need to start:
 
-  hc-a run --cwd DIR --name NAME <agent> "task"   start a child, prints its report line
-  hc-a tab --name NAME --argv '["<agent>"]' --task "task"   a tab in YOUR space
+  hc-a run --report --cwd DIR --name NAME <agent> "task"   start a child
+  hc-a tab --report --name NAME --argv '["<agent>"]' --task "task"   a tab in YOUR space
   hc-a ls | get [<t>] | read [<t>] --tail 60      what is running, what it printed
   hc-a send <t> "text"                            steer it
   hc-a wait [<t>] [--children any|all]            only when no report is coming
@@ -76,17 +78,43 @@ case ${1:-} in
   --skill) skill; exit 0 ;;
 esac
 
+# `hc-a <cmd> --help` is the first thing an agent tries; answer it before jq and hc are
+# checked, like the top level. Only the flag position counts, so `send t5 --help` stays data.
+if (( $# == 2 )) && [[ $2 == -h || $2 == --help ]]; then
+  case $1 in
+    ls|get|read|send|wait|run|tab|exec|kill|rm|label|templates|machines|dashboard) usage; exit 0 ;;
+  esac
+fi
+
 command -v jq >/dev/null || { printf 'error: jq not found\n' >&2; exit 127; }
 command -v "$HC" >/dev/null || { printf 'error: hc not found (set HC_BIN)\n' >&2; exit 127; }
 
-ERR=$(mktemp -t hca.XXXXXX)
-trap 'rm -f "$ERR"' EXIT
+ERR=$(mktemp -t hca.XXXXXX) || { printf 'error: cannot create a temporary file\n' >&2; exit 1; }
+OUT=""
+report_seq=0
+trap 'rm -f "$ERR" "$OUT"' EXIT
 
 # <t> default: your own terminal, exactly like hc itself.
 need_t() {
   local t=${1:-${HC_TERMINAL_ID:-}}
   [[ -n $t ]] || die "terminal required: pass <t> or run inside a herdr terminal"
   printf '%s' "$t"
+}
+
+# The contract line --report appends to the task: the child knows where to report and what
+# to do if hc send is unavailable in its sandbox. No argv guessing: the caller opts in.
+report_line() { # report_line <fallback-path-or-empty>
+  printf 'Report when done or stuck: hc send %s "done: …"' "$HC_TERMINAL_ID"
+  [[ -n ${1:-} ]] && printf '\nIf hc send fails, write %s and print the path.' "$1"
+}
+
+# One flat, unique path per child: display names never become directories, two unnamed
+# children never overwrite each other. The same path goes into the task and the output.
+report_path() { # report_path <name-or-empty>
+  local base=${1:-child}
+  [[ $base =~ ^[A-Za-z0-9_-]+$ && ${#base} -le 32 ]] || base=child
+  report_seq=$(( report_seq + 1 ))
+  printf '/tmp/%s-%s-%s.report.md' "$base" "$$" "$report_seq"
 }
 
 # hc errors are {"error":{kind,message,hint}} on stderr, sometimes after a startup
@@ -143,7 +171,14 @@ rows() { # rows <header-name>  (reads hc ls payload on stdin)
 
 ls_() {
   local args=(ls)
-  [[ ${1:-} == --all ]] && args+=(--all)
+  while (( $# )); do
+    case $1 in
+      -h|--help) usage; exit 0 ;;
+      --all) args+=(--all) ;;
+      *) die "unexpected argument: $1 (ls takes only --all; see hc-a --help)" ;;
+    esac
+    shift
+  done
   hcj "${args[@]}" | rows terminals
 }
 
@@ -151,22 +186,32 @@ dashboard() {
   local st ls_out working
   st=$(hcj server status) || exit $?
   ls_out=$(hcj ls) || exit $?
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$st" \
+    || { printf 'error: invalid JSON from hc server status\n' >&2; exit 1; }
+  jq -e 'type == "object" and (.terminals | type == "array")' >/dev/null 2>&1 <<<"$ls_out" \
+    || { printf 'error: invalid JSON from hc ls\n' >&2; exit 1; }
   jq -r '"core \(.version)  pid \(.pid)  live \(.live)  finished \(.finished)"' <<<"$st"
   rows terminals <<<"$ls_out"
   working=$(jq -r '[.terminals[] | select(.status=="working") | .address] | join(" ")' <<<"$ls_out")
   echo "help[4]:" 2>/dev/null
   if [[ -n $working ]]; then
-    echo "  working: $working — end your turn and wait for their report" 2>/dev/null
+    echo "  working: $working — read it; wait only for a child you started" 2>/dev/null
   else
     echo "  hc-a read <t> — what it printed last" 2>/dev/null
   fi
-  echo "  hc-a run --cwd DIR --name NAME claude \"task + report line\" — delegate" 2>/dev/null
-  echo "  hc-a tab --name NAME --argv '[\"claude\"]' --task \"…\" — own space" 2>/dev/null
+  echo "  hc-a run --report --cwd DIR --name NAME claude \"task\" — delegate" 2>/dev/null
+  echo "  hc-a tab --report --name NAME --argv '[\"claude\"]' --task \"…\" — own space" 2>/dev/null
   echo "  hc-a --skill — the contract" 2>/dev/null
 }
 
 get() {
-  local t; t=$(need_t "${1:-}") || exit $?
+  local t
+  case ${1:-} in
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown flag $1 (see hc-a --help)" ;;
+  esac
+  (( $# <= 1 )) || die "unexpected argument: $2 (get takes one terminal; see hc-a --help)"
+  t=$(need_t "${1:-}") || exit $?
   hcj get "$t" | jq -r --arg me "${HC_TERMINAL_ID:-}" '
     def s: if . == null then "-" else tostring end;
     def st: if (.status|type) == "object" then (.status.state // "-") else (.status // "-") end;
@@ -189,19 +234,32 @@ get() {
 read_() {
   local t
   if [[ ${1:-} == --* ]]; then t=$(need_t "") || exit $?; else t=$(need_t "${1:-}") || exit $?; shift || true; fi
-  local lines=0 tailn=60
+  local lines=0 tailn=60 lines_given=0
   while (( $# )); do
     case $1 in
-      --lines) [[ -n ${2:-} ]] || die "--lines needs a value"; lines=$2 ;;
-      --tail)  [[ -n ${2:-} ]] || die "--tail needs a value";  tailn=$2 ;;
-      *) die "unknown flag $1" ;;
+      -h|--help) usage; exit 0 ;;
+      --lines) [[ -n ${2:-} ]] || die "--lines needs a value"
+               [[ $2 =~ ^[0-9]+$ ]] || die "--lines needs a non-negative number"
+               (( ${#2} <= 7 )) && (( 10#$2 <= 1000000 )) || die "--lines is too large (max 1000000)"
+               lines=$2; lines_given=1 ;;
+      --tail)  [[ -n ${2:-} ]] || die "--tail needs a value"
+               [[ $2 =~ ^[0-9]+$ ]] || die "--tail needs a non-negative number"
+               (( ${#2} <= 7 )) && (( 10#$2 <= 1000000 )) || die "--tail is too large (max 1000000)"
+               tailn=$2 ;;
+      *) die "unknown flag $1 (see hc-a --help)" ;;
     esac
     shift $(( $# < 2 ? $# : 2 ))
   done
-  local out rc
-  out=$("$HC" read "$t" --lines "$lines" 2>"$ERR"); rc=$?
+  # `--lines` is history above the screen; without it ask for as much history as we tail,
+  # so `--tail 60` really is the last 60 lines and not just the tail of the current screen.
+  tailn=$(( 10#$tailn ))
+  (( lines_given )) || lines=$tailn
+  lines=$(( 10#$lines ))
+  local rc
+  OUT=$(mktemp -t hca.out.XXXXXX) || { printf 'error: cannot create a temporary file\n' >&2; exit 1; }
+  "$HC" read "$t" --lines "$lines" >"$OUT" 2>"$ERR"; rc=$?
   if (( rc != 0 )); then map_error "$(cat "$ERR")" read "$t"; exit "$rc"; fi
-  if [[ $tailn == 0 ]]; then printf '%s\n' "$out"; else printf '%s\n' "$out" | tail -n "$tailn"; fi
+  if (( tailn == 0 )); then cat "$OUT"; else tail -n "$tailn" "$OUT"; fi
 }
 
 send() {
@@ -212,7 +270,7 @@ send() {
   local text=$1; shift || true
   # `--` keeps text that starts with a dash from becoming an hc option.
   hcjx send --json "$@" -- "$t" "$text" | jq -r '
-    "sent: \(.started)  was: \(.status // "-") (turn \(.turn // "-"))"
+    "sent: true  started: \(if .started == null then "-" else .started end)  was: \(.status // "-") (turn \(.turn // "-"))"
     + (if .wait then "  → \(.wait.reason)  \(.wait.status // "-")\(if .wait.from then "  from: " + .wait.from else "" end)" else "" end)'
 }
 
@@ -231,23 +289,60 @@ wait_() {
 }
 
 run() {
-  local name="" cwd="" out
-  while [[ ${1:-} == --* ]]; do
+  local name="" cwd="" out report=0 fallback="" last
+  while [[ ${1:-} == -* ]]; do
     case $1 in
-      --name) [[ -n ${2:-} ]] || die "--name needs a value"; name=$2 ;;
-      --cwd)  [[ -n ${2:-} ]] || die "--cwd needs a value";  cwd=$2 ;;
+      -h|--help) usage; exit 0 ;;
+      --report) report=1; shift; continue ;;
+      --name=*) [[ -n ${1#*=} ]] || die "--name needs a value"; name=${1#*=}; shift; continue ;;
+      --cwd=*)  [[ -n ${1#*=} ]] || die "--cwd needs a value";  cwd=${1#*=}; shift; continue ;;
+      --name) [[ -n ${2:-} && ${2:0:1} != - ]] || die "--name needs a value"; name=$2 ;;
+      --cwd)  [[ -n ${2:-} && ${2:0:1} != - ]] || die "--cwd needs a value";  cwd=$2 ;;
       *) break ;;
     esac
-    shift $(( $# < 2 ? $# : 2 ))
+    shift 2
   done
+  # Split the forwarded hc options from the child argv: --report may sit among them, `--`
+  # ends them, and only a separate final child argument can be a task.
+  local -a av=("$@") fwd=() child=()
+  local i=0 t
+  while (( i < ${#av[@]} )); do
+    t=${av[$i]}
+    case $t in
+      --) fwd+=("$t"); i=$((i+1)); break ;;
+      --report) report=1; i=$((i+1)); continue ;;
+      --name=*) [[ -n ${t#*=} ]] || die "--name needs a value"; name=${t#*=}; i=$((i+1)); continue ;;
+      --cwd=*)  [[ -n ${t#*=} ]] || die "--cwd needs a value";  cwd=${t#*=}; i=$((i+1)); continue ;;
+      --name|--cwd)
+        [[ -n ${av[$((i+1))]:-} && ${av[$((i+1))]:0:1} != - ]] || die "$t needs a value"
+        if [[ $t == --name ]]; then name=${av[$((i+1))]}; else cwd=${av[$((i+1))]}; fi
+        i=$((i+2)); continue ;;
+      --on|--label|--parent|--timeout)
+        fwd+=("$t")
+        (( i + 1 < ${#av[@]} )) && fwd+=("${av[$((i+1))]}")
+        i=$((i+2)); continue ;;
+      -*) fwd+=("$t"); i=$((i+1)); continue ;;
+      *) break ;;
+    esac
+  done
+  (( i < ${#av[@]} )) && child=("${av[@]:$i}")
+  if (( report )); then
+    [[ -n ${HC_TERMINAL_ID:-} ]] || die "--report needs a herdr terminal (\$HC_TERMINAL_ID)"
+    (( ${#child[@]} >= 2 )) || die "--report needs a program and a task"
+    last=$(( ${#child[@]} - 1 ))
+    [[ -n ${child[$last]} ]] || die "--report needs a non-empty task"
+    fallback=$(report_path "${name:-child}")
+    child[$last]="${child[$last]}"$'\n\n'"$(report_line "$fallback")"
+  fi
   local args=(run --json --bg)
   [[ -n $name ]] && args+=(--name "$name")
   [[ -n $cwd ]] && args+=(--cwd "$cwd")
-  out=$(hcjx "${args[@]}" "$@") || exit $?
-  jq -r --arg me "${HC_TERMINAL_ID:-}" '"\(.address)  \(.state)  \(.agent)  \(.cwd)\(if .name then "  name=" + .name else "" end)"
+  out=$(hcjx "${args[@]}" ${fwd[@]+"${fwd[@]}"} ${child[@]+"${child[@]}"}) || exit $?
+  jq -r --arg me "${HC_TERMINAL_ID:-}" --arg fallback "$fallback" '"\(.address)  \(.state)  \(.agent)  \(.cwd)\(if .name then "  name=" + .name else "" end)"
     + (if .first_message and (.first_message.sent == false) then "  FIRST MESSAGE NOT SENT: \(.first_message.reason // "unknown")" else "" end)
     + (if $me != "" then "\nreport line for the task: hc send \($me) \"done: …\"" else "" end)
-    + "\nfallback for a sandboxed child: write /tmp/\(.name // .address).report.md and print the path"
+    + (if $fallback != "" then "\nfallback: write \($fallback) if hc send fails"
+       else "\nfallback for a sandboxed child: write /tmp/\(.name // .address).report.md and print the path" end)
     + "\nread: hc-a read \(.address)"' <<<"$out"
 }
 
@@ -285,22 +380,51 @@ own_space_id() { # own_space_id  (reads herdr-app ls)
 }
 
 tab_() {
-  local name="" space="" folder="" argv="" task="" mod="" props=""
-  while [[ ${1:-} == --* ]]; do
+  local name="" space="" folder="" argv="" task="" mod="" props="" report=0
+  local fallback="" opt val
+  while [[ ${1:-} == -* ]]; do
     case $1 in
+      -h|--help) usage; exit 0 ;;
+      --report) report=1; shift; continue ;;
+      --*=*)
+        opt=${1%%=*}; val=${1#*=}
+        case $opt in
+          --name|--space|--folder|--argv|--task|--mod|--props) ;;
+          *) die "unknown flag $opt (see hc-a --help)" ;;
+        esac
+        [[ -n $val ]] || die "$opt needs a value"
+        case $opt in
+          --name) name=$val ;;   --space) space=$val ;; --folder) folder=$val ;;
+          --argv) argv=$val ;;   --task) task=$val ;;   --mod) mod=$val ;; --props) props=$val ;;
+        esac
+        shift; continue ;;
       --name|--space|--folder|--argv|--task|--mod|--props)
-        [[ -n ${2:-} ]] || die "$1 needs a value"
+        [[ -n ${2:-} && ${2:0:1} != - ]] || die "$1 needs a value"
         case $1 in
           --name) name=$2 ;;   --space) space=$2 ;; --folder) folder=$2 ;;
           --argv) argv=$2 ;;   --task) task=$2 ;;   --mod) mod=$2 ;; --props) props=$2 ;;
         esac ;;
-      *) die "unknown flag $1" ;;
+      *) die "unknown flag $1 (see hc-a --help)" ;;
     esac
     shift $(( $# < 2 ? $# : 2 ))
   done
   (( $# == 0 )) || die "unexpected argument: $1 (tab takes only flags; see hc-a --help)"
 
+  if (( report )); then
+    [[ -n ${HC_TERMINAL_ID:-} ]] || die "--report needs a herdr terminal (\$HC_TERMINAL_ID)"
+    [[ -z $mod ]] || die "--report cannot be used with --mod"
+    [[ -n $task ]] || die "--report needs --task"
+    fallback=$(report_path "${name:-child}")
+    task="$task"$'\n\n'"$(report_line "$fallback")"
+  fi
+
   local sj sid
+  if [[ -n $argv ]]; then
+    jq -s -e 'length == 1 and (.[0] | type == "array" and length > 0
+      and ([.[] | type] | all(. == "string")))' \
+      >/dev/null 2>&1 <<<"$argv" \
+      || die "--argv needs one non-empty JSON array of strings, e.g. '[\"codex\"]'"
+  fi
   sj=$(app_json ls) || exit $?
   if [[ -n $space ]]; then
     sid=$(space_id "$space" <<<"$sj")
@@ -310,16 +434,19 @@ tab_() {
     [[ -n $sid ]] || die "cannot tell your space: run inside a herdr terminal or pass --space <id|name>"
   fi
 
-  local args=(do tab.new --space "$sid")
-  [[ -n $name ]]   && args+=(--name "$name")
-  [[ -n $folder ]] && args+=(--folder "$folder")
-  [[ -n $argv ]]   && args+=(--argv "$argv")
-  [[ -n $task ]]   && args+=(--task "$task")
-  [[ -n $mod ]]    && args+=(--mod "$mod")
-  [[ -n $props ]]  && args+=(--props "$props")
-
-  local out got tab term sname
-  out=$(app_json "${args[@]}") || exit $?
+  local payload got tab term sname
+  payload=$(jq -nc --arg space "$sid" --arg name "$name" --arg folder "$folder" \
+      --arg task "$task" --arg mod "$mod" --argjson argv "${argv:-null}" \
+      --argjson props "${props:-null}" '
+      {space: $space}
+      + (if $name   != "" then {name: $name} else {} end)
+      + (if $folder != "" then {folder: $folder} else {} end)
+      + (if $argv   != null then {argv: $argv} else {} end)
+      + (if $task   != "" then {task: $task} else {} end)
+      + (if $mod    != "" then {mod: $mod} else {} end)
+      + (if $props  != null then {props: $props} else {} end)') \
+    || die "tab arguments are not valid JSON"
+  out=$(app_json do tab.new "$payload") || exit $?
   got=$(jq -r '.space // empty' <<<"$out")
   tab=$(jq -r '.tab // empty' <<<"$out")
   term=$(jq -r '.terminal // empty' <<<"$out")
@@ -344,12 +471,15 @@ tab_() {
   printf 'close: herdr-app do tab.close --id %s --confirmed true\n' "$tab"
   if [[ -n $term ]]; then
     [[ -n ${HC_TERMINAL_ID:-} ]] && printf 'report line for the task: hc send %s "done: …"\n' "$HC_TERMINAL_ID"
+    [[ -n $fallback ]] && printf 'fallback: write %s if hc send fails\n' "$fallback"
     printf 'read: hc-a read %s\n' "$term"
   fi
 }
 
 case ${1:-} in
-  ""|dashboard) dashboard ;;
+  ""|dashboard)
+    (( $# <= 1 )) || die "unexpected argument: $2 (dashboard takes none; see hc-a --help)"
+    dashboard ;;
   ls)   shift; ls_ "$@" ;;
   get)  shift; get "$@" ;;
   read) shift; read_ "$@" ;;
@@ -357,7 +487,7 @@ case ${1:-} in
   wait) shift; wait_ "$@" ;;
   run)  shift; run "$@" ;;
   tab)  shift; tab_ "$@" ;;
-  exec) shift; [[ ${1:-} == -- ]] && shift; "$HC" exec "$@" ;;
+  exec) shift; "$HC" exec "$@" ;;
   kill|rm|label)
     cmd=$1; shift
     res=$(hcj "$cmd" "$@") || exit $?
@@ -365,10 +495,12 @@ case ${1:-} in
     ;;
   templates)
     shift
+    (( $# == 0 )) || die "unexpected argument: $1 (templates takes none; see hc-a --help)"
     hcj templates | jq -r 'if (.templates|length)==0 then "no templates" else (.templates[] | "\(.name)  \(.description // "-")") end'
     ;;
   machines)
     shift
+    (( $# == 0 )) || die "unexpected argument: $1 (machines takes none; see hc-a --help)"
     hcj machine ls | jq -r 'if (.machines|length)==0 then "no machines" else (.machines[] | "\(.name)  \(.host // "-")  \(.state // "-")") end'
     ;;
   *) printf 'error: unknown command %s\n' "$1" >&2; usage >&2; exit 2 ;;
