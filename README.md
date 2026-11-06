@@ -46,8 +46,7 @@ export PATH="$HOME/.local/bin:$PATH"        # put this in your shell profile to 
 
 `hc-a` finds its contract through the symlink, so `--skill` works from `~/.local/bin`. Requires
 `bash` (3.2 is fine), `jq`, and `hc` on `PATH` (or `HC_BIN`). `--help` and `--skill` work
-without either, so a fresh machine can be read before anything is installed. The private remote
-needs your GitHub access.
+without either, so a fresh machine can be read before anything is installed.
 
 ## Commands
 
@@ -127,3 +126,7 @@ Each test pins a real defect found in review: exit codes lost through command su
 `send --wait` dropping its outcome, an unsent first message staying invisible, `read` dumping
 the whole screen, raw JSON errors, missing `<t>`, missing flag values, a dead core exiting 0,
 and TOON fields broken by commas, quotes, backslashes or newlines.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
