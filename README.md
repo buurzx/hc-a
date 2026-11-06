@@ -66,6 +66,34 @@ the next input and costs nothing while idle. `hc-a wait` is for the three cases 
 report is coming: the child was not told to report, a barrier between steps, or one specific
 fact before publishing. `SKILL.md` is the same contract in the form agents load.
 
+## Workflow: one coordinator, several children
+
+```sh
+# 1. launch — the report line comes out of the command, paste it into the task
+hc-a run --cwd ~/proj --name api claude \
+  'Add pagination to /users. Report when done or stuck: hc send t55 "done: ..."'
+# t5a  live  claude  /Users/me/proj  name=api
+# report line for the task: hc send t55 "done: …"
+# read: hc-a read t5a
+
+hc-a run --cwd ~/proj --name tests claude 'Cover it. Report when done: hc send t55 "done: ..."'
+
+# 2. do your own work. Nothing left? End your turn — reports wake you.
+
+# 3. a report arrives as your next input:
+#    <hc from="t5a api">done: endpoints paginated, 3 files changed</hc>
+hc-a get t5a          # t5a  live · done (turn 7)
+                      #   agent: claude   cwd: /Users/me/proj   pid: 81234
+hc-a read t5a --tail 40
+
+# 4. barrier before publishing, then clean up
+hc-a wait t55 --children all --timeout 900
+hc-a kill t5a; hc-a rm t5a
+```
+
+A child that dies or blocks without reporting raises its own note
+(`<hc>t5a api exited (signal 9)</hc>`), so step 3 fires either way: silence is never ambiguous.
+
 ## Tests
 
 ```sh
