@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Tests for hc-a. No herdr, no network: `hc` is replaced by a stub via HC_BIN.
-# Each test pins one defect found in the 3-round review. Run: bash hc-a.test.sh
+# Each case runs in a clean environment (env -i) so nothing leaks from the caller's terminal.
+# Run: bash hc-a.test.sh
 set -u
 
 HCA="$(cd "$(dirname "$0")" && pwd)/hc-a"
@@ -10,7 +11,7 @@ trap 'rm -rf "$TMP"' EXIT
 STUB="$TMP/hc"
 cat >"$STUB" <<'STUB'
 #!/usr/bin/env bash
-echo "$*" >> "$FAKE_LOG"
+printf '<%s>\n' "$@" >> "$FAKE_LOG"
 key=$1
 [[ $key == server ]] && key=status
 [[ $key == machine ]] && key=machines
@@ -21,29 +22,33 @@ exit 0
 STUB
 chmod +x "$STUB"
 
+TMO=""
+if command -v timeout >/dev/null 2>&1; then TMO="timeout 15"; fi
+
 passn=0; failn=0
 pass() { passn=$((passn+1)); printf '  ok    %s\n' "$1"; }
 fail() { failn=$((failn+1)); printf '  FAIL  %s\n' "$1"; [[ -n ${2:-} ]] && printf '        %s\n' "$2"; }
 
-# fx <key> <stdout> [stderr] [rc]
-fx() {
+fx() { # fx <key> <stdout> [stderr] [rc]
   printf '%s' "$2" >"$FAKE_DIR/$1.out"
   [[ -n ${3:-} ]] && printf '%s' "$3" >"$FAKE_DIR/$1.err"
   [[ -n ${4:-} ]] && printf '%s' "$4" >"$FAKE_DIR/$1.rc"
   return 0
 }
 reset() { rm -rf "$FAKE_DIR"; mkdir -p "$FAKE_DIR"; : >"$FAKE_LOG"; }
-# run_a [env assignments...] -- hc-a args
+
+# run_a [-u VAR | VAR=value]... -- hc-a args   (clean environment, stub hc)
 run_a() {
-  local unset_args=() assigns=()
+  local assigns=() unsets=()
   while [[ ${1:-} != -- ]]; do
     case $1 in
-      -u) unset_args+=(-u "$2"); shift 2 ;;
+      -u) unsets+=(-u "$2"); shift 2 ;;
       *)  assigns+=("$1"); shift ;;
     esac
   done
   shift
-  env ${unset_args[@]+"${unset_args[@]}"} HC_BIN="$STUB" FAKE_DIR="$FAKE_DIR" FAKE_LOG="$FAKE_LOG" \
+  $TMO env -i ${unsets[@]+"${unsets[@]}"} PATH="$JQDIR:/usr/bin:/bin:/usr/sbin:/sbin" LANG=C \
+    TMPDIR="$TMP" HC_BIN="$STUB" FAKE_DIR="$FAKE_DIR" FAKE_LOG="$FAKE_LOG" \
     ${assigns[@]+"${assigns[@]}"} "$HCA" "$@"
 }
 same() { [[ "$1" == "$2" ]] && pass "$3" || fail "$3" "want [$2] got [$1]"; }
@@ -51,7 +56,26 @@ has()  { case "$1" in *"$2"*) pass "$3";; *) fail "$3" "want substring [$2] in [
 hasnt(){ case "$1" in *"$2"*) fail "$3" "unwanted [$2] in [$1]";; *) pass "$3";; esac; }
 rc_is(){ [[ "$1" == "$2" ]] && pass "$3" || fail "$3" "want rc $2 got $1"; }
 
+JQDIR=$(dirname "$(command -v jq)")
 FAKE_DIR="$TMP/fx"; FAKE_LOG="$TMP/args.log"; mkdir -p "$FAKE_DIR"
+
+# ------------------------------------------------------------ help without deps
+out=$(env -i PATH=/usr/bin:/bin "$HCA" --help 2>&1); rc=$?
+rc_is "$rc" 0 "help: works with no jq and no hc"
+has "$out" "hc-a — agent view of hc" "help: prints usage"
+
+mkdir -p "$TMP/inst/bin" "$TMP/inst/repo"
+cp "$HCA" "$TMP/inst/repo/hc-a"
+printf -- '---\nname: x\n---\nBODY-LINE\n' >"$TMP/inst/repo/SKILL.md"
+ln -sf ../repo/hc-a "$TMP/inst/bin/hc-a"
+out=$(env -i PATH=/usr/bin:/bin "$TMP/inst/bin/hc-a" --skill 2>&1); rc=$?
+rc_is "$rc" 0 "skill: works with no jq and no hc"
+has "$out" "BODY-LINE" "skill: found through the install symlink"
+hasnt "$out" "name: x" "skill: front matter stripped"
+
+mkdir -p "$TMP/alone"; cp "$HCA" "$TMP/alone/hc-a"
+out=$(env -i PATH=/usr/bin:/bin "$TMP/alone/hc-a" --skill 2>&1)
+has "$out" "standalone install" "skill: incomplete standalone fallback"
 
 # ---------------------------------------------------------------- P1.1 run rc
 reset
@@ -66,10 +90,28 @@ reset
 fx run '{"address":"t9","state":"live","agent":"sh","cwd":"/tmp"}'
 out=$(run_a -- run --name x -- sh -c 'echo hi' 2>&1)
 log=$(cat "$FAKE_LOG")
-has "$log" 'run --json --bg' "argv: --json sits before positionals"
+has "$log" '<sh>
+<-c>
+<echo hi>' "argv: program and its argument stay separate"
 case "$log" in
-  *'-- sh -c echo hi') pass "argv: program stays last, no --json after it";;
-  *) fail "argv: program stays last, no --json after it" "got [$log]";;
+  *'<--json>'*'<-->'*) pass "argv: --json sits before the -- delimiter";;
+  *) fail "argv: --json sits before the -- delimiter" "got [$log]";;
+esac
+after=$(sed -n '/^<-->$/,$p' "$FAKE_LOG" | tail -n +2)
+same "$after" '<sh>
+<-c>
+<echo hi>' "argv: nothing but the program after --"
+
+# ------------------------------------------------- send: text starting with --
+reset
+fx send '{"started":true,"status":"done","turn":3}'
+out=$(run_a HC_TERMINAL_ID=t55 -- send t5 --help)
+log=$(cat "$FAKE_LOG")
+case "$log" in
+  *'<-->
+<t5>
+<--help>'*) pass "send: text after a dash stays data, behind --";;
+  *) fail "send: text after a dash stays data, behind --" "got [$log]";;
 esac
 
 # ------------------------------------------------------ P1.2 wait rendering
@@ -94,9 +136,10 @@ same "$out" 'sent: true  was: done (turn 3)  → not_started  -' "send: --wait o
 # ------------------------------------------------------- P1.4 first_message
 reset
 fx run '{"address":"t9","state":"live","agent":"claude","cwd":"/tmp","name":"fix","first_message":{"sent":false,"reason":"readiness"}}'
-out=$(run_a -- run --name fix claude 'do x')
+out=$(run_a HC_TERMINAL_ID=t55 -- run --name fix claude 'do x')
 has "$out" 'FIRST MESSAGE NOT SENT: readiness' "run: unsent first message is flagged"
 has "$out" 'hc send t55' "run: prints the caller's report line"
+has "$out" '/tmp/fix.report.md' "run: prints the fallback report path"
 
 reset
 fx get '{"address":"t9","state":"live","cwd":"/tmp","argv":["claude"],"first_message":{"sent":false,"reason":"readiness"}}'
@@ -106,12 +149,9 @@ has "$out" 'FIRST MESSAGE NOT SENT: readiness' "get: unsent first message is fla
 # ------------------------------------------------------------- P2.1 read size
 reset
 seq 1 100 >"$FAKE_DIR/read.out"
-n=$(run_a -- read t5 | wc -l | tr -d ' ')
-same "$n" 60 "read: default keeps the last 60 lines"
-n=$(run_a -- read t5 --tail 0 | wc -l | tr -d ' ')
-same "$n" 100 "read: --tail 0 keeps the whole screen"
-n=$(run_a -- read t5 --tail 5 | wc -l | tr -d ' ')
-same "$n" 5 "read: --tail N"
+same "$(run_a -- read t5 | wc -l | tr -d ' ')" 60 "read: default keeps the last 60 lines"
+same "$(run_a -- read t5 --tail 0 | wc -l | tr -d ' ')" 100 "read: --tail 0 keeps the whole screen"
+same "$(run_a -- read t5 --tail 5 | wc -l | tr -d ' ')" 5 "read: --tail N"
 
 # ------------------------------------------------------- P2.1 read error path
 reset
@@ -121,26 +161,41 @@ rc_is "$rc" 3 "read: exit code is hc's"
 same "$out" 'error: no terminal "zzz"
 help: see `hc ls --all`' "read: error is parsed, not dumped as JSON"
 
+# --------------------------------------------- P2.1 diagnostic before the JSON
+reset
+fx ls '{"terminals":[]}' 'hc: startup diagnostic
+{"error":{"message":"cannot start core","hint":"check the core log"}}' 5
+out=$(run_a -- ls 2>&1); rc=$?
+rc_is "$rc" 5 "mixed stderr: exit code preserved"
+has "$out" 'error: cannot start core' "mixed stderr: structured error extracted"
+has "$out" 'help: check the core log' "mixed stderr: hint survives"
+hasnt "$out" '"error"' "mixed stderr: no raw JSON leaked"
+
 # ------------------------------------------------------- P2.2 missing values
 reset
-out=$(run_a -- read --lines 2>&1); rc=$?
+out=$(run_a -- read t5 --lines 2>&1); rc=$?
 rc_is "$rc" 2 "read: --lines without a value fails cleanly"
 same "$out" 'error: --lines needs a value' "read: --lines message"
-out=$(run_a -- run --cwd 2>&1); rc=$?
-same "$out" 'error: --cwd needs a value' "run: --cwd message"
+same "$(run_a -- run --cwd 2>&1)" 'error: --cwd needs a value' "run: --cwd message"
 
 # ------------------------------------------------------ P2.3 <t> defaulting
 reset
 fx get '{"address":"t55","state":"live","cwd":"/tmp","argv":["zsh"]}'
 out=$(run_a HC_TERMINAL_ID=t55 -- get)
 has "$out" '*t55' "get: no argument means your own terminal"
-log=$(cat "$FAKE_LOG")
-same "$log" 'get t55 --json' "get: own address reaches hc"
+same "$(cat "$FAKE_LOG")" '<get>
+<t55>
+<--json>' "get: own address reaches hc"
 
 reset
-out=$(run_a -u HC_TERMINAL_ID -- get 2>&1); rc=$?
+out=$(run_a -- get 2>&1); rc=$?
 rc_is "$rc" 2 "outside herdr: exit code 2, not hc's"
 same "$out" 'error: terminal required: pass <t> or run inside a herdr terminal' "outside herdr: single clean message"
+
+for c in read wait; do
+  out=$(run_a -- $c 2>&1); rc=$?
+  rc_is "$rc" 2 "$c: no terminal outside herdr is rc 2"
+done
 
 # --------------------------------------------------------- P2.4 dashboard
 reset
@@ -154,6 +209,38 @@ fx status '{"version":"0.1.18","pid":1,"live":1,"finished":0}'
 fx ls '{"terminals":[{"address":"t1","agent":"zsh","state":"live","status":null,"turn":0,"where":"a / 1"}]}'
 err=$(run_a -- dashboard 2>&1 >/dev/null)
 same "$err" '' "dashboard: nothing on stderr on the happy path"
+
+# --------------------------------------------------------- missing surfaces
+reset
+fx ls '{"terminals":[]}'
+out=$(run_a -- ls --all)
+has "$(cat "$FAKE_LOG")" '<--all>' "ls --all: forwarded to hc"
+
+reset
+fx exec 'out-line' 'err-line' 7
+out=$(run_a -- exec -- /usr/bin/true 2>"$TMP/e"); rc=$?
+rc_is "$rc" 7 "exec: program exit code is kept"
+same "$out" 'out-line' "exec: stdout passes through"
+same "$(cat "$TMP/e")" 'err-line' "exec: stderr passes through"
+
+reset
+out=$(run_a -- nope 2>&1); rc=$?
+rc_is "$rc" 2 "unknown command: rc 2"
+has "$out" 'error: unknown command nope' "unknown command: message"
+
+reset
+fx get '' '{"error":{"kind":"not_found","message":"no terminal \"zz\"","hint":"see `hc ls --all`"}}' 3
+out=$(run_a -- get zz 2>&1); rc=$?
+rc_is "$rc" 3 "get: missing terminal keeps rc 3"
+has "$out" 'error: no terminal "zz"' "get: structured error"
+
+reset
+fx templates '{"templates":[]}'
+same "$(run_a -- templates)" 'no templates' "templates: empty case"
+fx templates '{"templates":[{"name":"reviewer","description":"reviews"}]}'
+same "$(run_a -- templates)" 'reviewer  reviews' "templates: rows"
+fx machines '{"machines":[]}'
+same "$(run_a -- machines)" 'no machines' "machines: empty case"
 
 # ------------------------------------------------------------ P2.5 TOON
 reset

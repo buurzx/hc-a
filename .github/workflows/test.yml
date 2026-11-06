@@ -1,0 +1,23 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: jq (Linux runners ship it, macOS ships it too)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: suite (default shell bash)
+        run: bash hc-a.test.sh
+      - name: suite (bash 3.2 on macOS)
+        if: runner.os == 'macOS'
+        run: /bin/bash hc-a.test.sh

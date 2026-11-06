@@ -3,13 +3,14 @@
 Agent-facing wrapper over `hc` ([herdr-core](https://herdr.dev)): persistent terminals,
 child agents, and reports between them, shaped for a model rather than for a person.
 
-`hc-a` does not implement anything. Every command is one `hc` call; the value is in three
-places — the payload, the errors, and the contract.
+`hc-a` does not implement anything: it projects `hc` calls. Most commands are one upstream
+call; the dashboard is two (`server status`, then `ls`). The value is in three places — the
+payload, the errors, and the contract.
 
 ```
 $ hc-a
-core 0.1.18  pid 65148  live 3  finished 11
-terminals[3]{address,agent,state,status,turn,where}:
+core 0.1.18  pid 65148  live 2  finished 11
+terminals[2]{address,agent,state,status,turn,where}:
   t2q,omp,live,done,287,t-monitor / coordinator
   *t55,omp,live,working,3,agentic-system / 2
 help[3]:
@@ -21,19 +22,32 @@ help[3]:
 ## Why not the CLI as-is
 
 `hc` prints compact tables only when stdout is a terminal. An agent's stdout is a pipe, so it
-always gets the full JSON: 879 B for six terminals, 787 B for one `get`. `hc-a` projects the
-same call to 306 B and 161 B. Errors arrive as `{"error":{kind,message,hint}}` on stderr;
-`hc-a` turns them into two lines and keeps `hc`'s exit code.
+always gets the full JSON. One observed snapshot on 2026-11-06 with `hc 0.1.18`, six live
+terminals:
+
+```sh
+hc ls --json | wc -c      # 879      hc-a ls | wc -c      # 306
+hc get t2q --json | wc -c # 787      hc-a get t2q | wc -c # 161
+```
+
+Sizes depend on terminal count and content; this is one measurement, not a guarantee. Errors
+arrive as `{"error":{kind,message,hint}}` on stderr — sometimes after a startup diagnostic line
+— and `hc-a` turns the last structured one into two lines while keeping `hc`'s exit code.
 
 ## Install
 
 ```sh
-git clone <this repo> ~/projects/hc-a
-ln -sf ~/projects/hc-a/hc-a   ~/.local/bin/hc-a
-ln -sf ~/projects/hc-a/SKILL.md ~/.agents/skills/herdr/SKILL.md   # optional: teaches agents the contract
+mkdir -p ~/projects ~/.local/bin ~/.agents/skills/herdr
+git clone git@github.com:buurzx/hc-a.git ~/projects/hc-a
+ln -sf ~/projects/hc-a/hc-a ~/.local/bin/hc-a
+ln -sf ~/projects/hc-a/SKILL.md ~/.agents/skills/herdr/SKILL.md   # optional: agents load it
+export PATH="$HOME/.local/bin:$PATH"        # put this in your shell profile to keep it
 ```
 
-Requires `bash` (3.2 is fine), `jq`, and `hc` on `PATH` (or `HC_BIN`).
+`hc-a` finds its contract through the symlink, so `--skill` works from `~/.local/bin`. Requires
+`bash` (3.2 is fine), `jq`, and `hc` on `PATH` (or `HC_BIN`). `--help` and `--skill` work
+without either, so a fresh machine can be read before anything is installed. The private remote
+needs your GitHub access.
 
 ## Commands
 
@@ -47,11 +61,12 @@ Requires `bash` (3.2 is fine), `jq`, and `hc` on `PATH` (or `HC_BIN`).
 | `hc-a wait [<t>] [--children any\|all]` | blocks in the core; prints `reason`, so a timeout check-in is not mistaken for an exit |
 | `hc-a run [--name N] [--cwd P] cmd…` | start a terminal; prints the report line to put in its task |
 | `hc-a exec -- cmd…` | no terminal; text out, exit code kept |
-| `hc-a kill\|rm\|label <t>` | lifetime |
+| `hc-a kill <t>` / `rm <t>` / `label <t> k=v…` | lifetime, labels |
 | `hc-a templates\|machines` | roles, remote machines |
 
-`<t>` is an address (`t7`), a name, or `machine/t7`; omitted for `get`/`read`/`wait` it means
-your own terminal (`$HC_TERMINAL_ID`).
+`<t>` is an address (`t7`), a name, or `machine/t7`. For `get`/`read`/`wait` it may be omitted
+and means your own terminal (`$HC_TERMINAL_ID`); `send` always needs one, because a message is
+not a terminal. Text after a dash (`--help`) is sent as data, not read as an option.
 
 ## The contract
 
@@ -65,6 +80,11 @@ Then do your own work; when nothing is left, end your turn — the report arrive
 the next input and costs nothing while idle. `hc-a wait` is for the three cases where no
 report is coming: the child was not told to report, a barrier between steps, or one specific
 fact before publishing. `SKILL.md` is the same contract in the form agents load.
+
+Two preconditions for the "silence is never ambiguous" part: automatic notes must be enabled
+(`notes = false` in `~/.config/herdr-core/config.toml` and `hc run --no-notify` both disable
+them), and a sandboxed child may be unable to run `hc send` at all. So name a fallback file in
+the task; if neither a report nor a failure note arrives, `hc-a read <t>` and look there.
 
 ## Workflow: one coordinator, several children
 
@@ -92,12 +112,13 @@ hc-a kill t5a; hc-a rm t5a
 ```
 
 A child that dies or blocks without reporting raises its own note
-(`<hc>t5a api exited (signal 9)</hc>`), so step 3 fires either way: silence is never ambiguous.
+(`<hc>t5a api exited (signal 9)</hc>`), provided notes are enabled. With `--no-notify` or
+`notes = false`, step 3 never fires — use `hc-a wait` instead of ending your turn.
 
 ## Tests
 
 ```sh
-bash hc-a.test.sh      # 32 assertions, no herdr, no network
+bash hc-a.test.sh      # 58 assertions, no herdr, no network
 ```
 
 `hc` is replaced by a stub through `HC_BIN`, so every test is deterministic and runs anywhere.
